@@ -2,6 +2,7 @@ import User from "../models/User.js";
 import { RegisterSchema, LoginSchema } from "../schema/User.js";
 import { generateToken } from "../utils/methods.js";
 import { auth } from "../config/firebase.js";
+import bcrypt from "bcryptjs";
 
 /**
  * @Descrition Register a new user
@@ -27,7 +28,9 @@ export const Register = async (req, res) => {
         .status(400)
         .json({ status: false, msg: "User already exists" });
     }
-    const user = await User.create(payload);
+    const salt = await bcrypt.genSalt(10);
+    const hashPassword = await bcrypt.hash(payload.password, salt);
+    const user = await User.create({...payload, password: hashPassword});
     const token = generateToken(user);
    
     return res
@@ -64,11 +67,25 @@ export const Login = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: payload.email });
+    const user = await User.findOne({ email: payload.email }).select("+password");
     if (!user) {
       return res
         .status(400)
         .json({ status: false, msg: "User not found" });
+    }
+
+    if (!user.password) {
+      return res.status(400).json({ 
+        status: false, 
+        msg: "This account was created via social login. Please login with Google or Microsoft." 
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(payload.password, user.password);
+    if (!isPasswordValid) {
+      return res
+        .status(400)
+        .json({ status: false, msg: "Invalid password" });
     }
     const token = generateToken(user);
    
@@ -90,7 +107,7 @@ export const Login = async (req, res) => {
 
 /**
  * @Descrition login or signup with Firebase (Google, Microsoft, etc.)
- * @Route POST /api/user/firebase-auth
+ * @Route POST /api/user/signupwithmicrosoft/google
  * @Access Public
  */
 export const SignupWithFirebase = async (req, res) => {
