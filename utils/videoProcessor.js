@@ -3,8 +3,22 @@ import ffprobe from '@ffprobe-installer/ffprobe';
 import ffmpegStatic from '@ffmpeg-installer/ffmpeg';
 import { Readable, PassThrough } from 'stream';
 
-ffmpeg.setFfprobePath(ffprobe.path);
-ffmpeg.setFfmpegPath(ffmpegStatic.path);
+import { execSync } from 'child_process';
+
+// Helper to determine the best binary path (System vs NPM Package)
+const getBinaryPath = (npmPath, name) => {
+    try {
+        execSync(`which ${name}`, { stdio: 'ignore' });
+        console.log(`Using system ${name}`);
+        return name;
+    } catch (e) {
+        console.log(`Using NPM package for ${name}`);
+        return npmPath;
+    }
+};
+
+ffmpeg.setFfprobePath(getBinaryPath(ffprobe.path, 'ffprobe'));
+ffmpeg.setFfmpegPath(getBinaryPath(ffmpegStatic.path, 'ffmpeg'));
 
 // Standard quality heights (based on the shorter dimension)
 export const RESOLUTIONS = [
