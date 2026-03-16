@@ -4,7 +4,6 @@ import cors from "cors";
 
 const app = express();
 
-
 //CORS
 app.use(cors(
   {
@@ -28,7 +27,6 @@ connectDb();
 
 //Connecting routes
 app.use("/api", apiRouter);
-
 
 //Connect Server
 const PORT = process.env.PORT || 8080;
