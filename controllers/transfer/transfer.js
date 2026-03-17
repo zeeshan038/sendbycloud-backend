@@ -86,7 +86,10 @@ const createZipAndUpload = async (transferId, files, shortId) => {
 
 const extractVideoResolutions = async (transferId, files) => {
     try {
-        const updatedFiles = JSON.parse(JSON.stringify(files)); // Deep clone
+        const transfer = await File.findById(transferId);
+        if (!transfer) return;
+
+        const updatedFiles = transfer.files;
         let hasChanges = false;
 
         for (let i = 0; i < updatedFiles.length; i++) {
@@ -107,32 +110,31 @@ const extractVideoResolutions = async (transferId, files) => {
 
                 const metadata = await getVideoMetadata(signedUrl);
                 if (metadata && metadata.resolution) {
-                    // Collect lower resolutions based on the shorter side
-                    const currentShortSide = metadata.shortSide;
-                    const isPortrait = metadata.height > metadata.width;
-                    
-                    const targets = RESOLUTIONS.filter(r => {
-                        // Allow if it's strictly shorter side
-                        if (r.shortSide < currentShortSide) {
-                            // If it's the same bucket (e.g. 480p), only generate if original is significantly bigger (>10%)
-                            if (r.label === metadata.resolution) {
-                                return (currentShortSide - r.shortSide) / r.shortSide > 0.1;
-                            }
-                            return true;
+                    // Set initial metadata
+                    if (typeof updatedFiles[i] === 'string') {
+                        updatedFiles[i] = {
+                            key: objectKey,
+                            resolution: metadata.resolution,
+                            duration: metadata.duration,
+                            qualities: [{ label: 'Original', key: objectKey, isOriginal: true }]
+                        };
+                    } else {
+                        updatedFiles[i].resolution = metadata.resolution;
+                        updatedFiles[i].duration = metadata.duration;
+                        updatedFiles[i].metadata = metadata;
+                        if (!updatedFiles[i].qualities) {
+                            updatedFiles[i].qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
                         }
-                        return false;
-                    });
+                    }
                     
-                    const qualities = [];
-                    // Add original
-                    qualities.push({
-                        label: metadata.resolution,
-                        key: objectKey,
-                        isOriginal: true
-                    });
+                    // Save initial metadata immediately
+                    await File.findByIdAndUpdate(transferId, { files: updatedFiles });
+                    console.log(`Initial metadata stored for ${objectKey}`);
 
-                    // Generate lower qualities
-                    const folderPrefix = process.env.R2_FOLDER ? `${process.env.R2_FOLDER}/` : "";
+                    const currentShortSide = metadata.shortSide;
+                    const targets = RESOLUTIONS.filter(r => r.shortSide < currentShortSide); 
+
+                    // Process each target resolution
                     for (const targetRes of targets) {
                         try {
                             const pathParts = objectKey.split('/');
@@ -140,6 +142,7 @@ const extractVideoResolutions = async (transferId, files) => {
                             const folderPath = pathParts.join('/');
                             const resKey = `${folderPath}/${targetRes.label}_${fileName}`;
                             
+                            console.log(`Starting transcoding: ${targetRes.label} for ${fileName}`);
                             const transcodeStream = transcodeVideo(signedUrl, targetRes);
                             
                             const upload = new Upload({
@@ -153,41 +156,37 @@ const extractVideoResolutions = async (transferId, files) => {
                             });
 
                             await upload.done();
-                            qualities.push({
-                                label: targetRes.label,
-                                key: resKey,
-                                isOriginal: false
-                            });
-                            console.log(`Successfully generated ${targetRes.label} for ${objectKey}`);
+
+                            // Update the qualities array in the DB incrementally
+                            const currentTransfer = await File.findById(transferId);
+                            if (currentTransfer) {
+                                const fileToUpdate = currentTransfer.files[i];
+                                if (fileToUpdate && fileToUpdate.qualities) {
+                                    // Check if already exists to avoid duplicates
+                                    if (!fileToUpdate.qualities.some(q => q.label === targetRes.label)) {
+                                        fileToUpdate.qualities.push({
+                                            label: targetRes.label,
+                                            key: resKey,
+                                            isOriginal: false
+                                        });
+                                        
+                                        // Update specifically this file in the array
+                                        await File.updateOne(
+                                            { _id: transferId },
+                                            { $set: { [`files.${i}`]: fileToUpdate } }
+                                        );
+                                        console.log(`Incremental update: Added ${targetRes.label} to ${objectKey}`);
+                                    }
+                                }
+                            }
                         } catch (transErr) {
                             console.error(`Transcoding failed for ${targetRes.label}:`, transErr.message);
                         }
                     }
-
-                    if (typeof updatedFiles[i] === 'string') {
-                        updatedFiles[i] = {
-                            key: objectKey,
-                            resolution: metadata.resolution,
-                            duration: metadata.duration,
-                            qualities: qualities
-                        };
-                    } else {
-                        updatedFiles[i].resolution = metadata.resolution;
-                        updatedFiles[i].duration = metadata.duration;
-                        updatedFiles[i].metadata = metadata;
-                        updatedFiles[i].qualities = qualities;
-                    }
-                    hasChanges = true;
-                    console.log(`Video processed with ${qualities.length} qualities: ${objectKey}`);
                 }
             } catch (err) {
-                console.warn(`Could not probe video ${objectKey}, it might still be uploading or inaccessible.`, err.message);
+                console.warn(`Could not probe video ${objectKey}`, err.message);
             }
-        }
-
-        if (hasChanges) {
-            await File.findByIdAndUpdate(transferId, { files: updatedFiles });
-            console.log(`Stored resolutions for transfer ${transferId}`);
         }
     } catch (error) {
         console.error("Error in extractVideoResolutions:", error);
@@ -195,7 +194,7 @@ const extractVideoResolutions = async (transferId, files) => {
 };
 
 export const sendFile = async (req, res) => {
-    const { getShareableLink = false, selfDestruct = false } = req.query;
+    const { getShareableLink = false, selfDestruct = false , isDownloadAble = false } = req.query;
     const payload = req.body;
 
     // Validation
@@ -237,6 +236,7 @@ export const sendFile = async (req, res) => {
             expireIn,
             background,
             selfDestruct: selfDestruct === 'true' || selfDestruct === true,
+            isDownloadAble: isDownloadAble === 'true' || isDownloadAble === true,
             shortId: payloadShortId || payloadTransferId || nanoid(8)
         });
 
@@ -599,20 +599,27 @@ export const getDownloadUrl = async (req, res) => {
                     resolution: fileData.resolution || null,
                     duration: fileData.duration || null,
                     streamUrl: /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName) 
-                        ? `${process.env.BACKEND_URL || 'http://localhost:8080'}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
+                        ?process.env.BACKEND_URL `${'http://localhost:8080'}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
                         : null
                 };
             })
         );
 
         let zipUrl = null;
-        if (transfer.zipKey) {
-            const zipCommand = new GetObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: transfer.zipKey,
-                ResponseContentDisposition: `attachment; filename="all_files.zip"`
-            });
-            zipUrl = await getSignedUrl(r2Client, zipCommand, { expiresIn: 604800 });
+        let zipStatus = "none";
+
+        if (transfer.files.length > 1) {
+            if (transfer.zipKey) {
+                const zipCommand = new GetObjectCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: transfer.zipKey,
+                    ResponseContentDisposition: `attachment; filename="all_files.zip"`
+                });
+                zipUrl = await getSignedUrl(r2Client, zipCommand, { expiresIn: 604800 });
+                zipStatus = "ready";
+            } else {
+                zipStatus = "processing";
+            }
         }
 
 
@@ -626,7 +633,9 @@ export const getDownloadUrl = async (req, res) => {
             status: true,
             files: fileUrls,
             zipUrl,
+            zipStatus,
             isSelfDestruct: transfer.selfDestruct,
+            isDownloadAble: transfer.isDownloadAble,
             transferDetails: {
                 senderEmail: transfer.senderEmail,
                 recevierEmails: transfer.recevierEmails,

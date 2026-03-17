@@ -46,7 +46,6 @@ export const getVideoMetadata = (source) => {
 
             const { width, height, duration } = videoStream;
             
-            // YouTube-style: Use the shorter side to determine the resolution label
             const shortSide = Math.min(width, height);
             
             let resolution = 'SD';
