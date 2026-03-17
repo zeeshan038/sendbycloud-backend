@@ -599,7 +599,7 @@ export const getDownloadUrl = async (req, res) => {
                     resolution: fileData.resolution || null,
                     duration: fileData.duration || null,
                     streamUrl: /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName) 
-                        ?process.env.BACKEND_URL `${'http://localhost:8080'}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
+                        ?process.env.BACKEND_URL||`${'http://localhost:8080'}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
                         : null
                 };
             })
