@@ -2,17 +2,15 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffprobe from '@ffprobe-installer/ffprobe';
 import ffmpegStatic from '@ffmpeg-installer/ffmpeg';
 import { Readable, PassThrough } from 'stream';
-
 import { execSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
-// Helper to determine the best binary path (System vs NPM Package)
 const getBinaryPath = (npmPath, name) => {
     try {
-        execSync(`which ${name}`, { stdio: 'ignore' });
-        console.log(`Using system ${name}`);
+        execSync(process.platform === 'win32' ? `where ${name}` : `which ${name}`, { stdio: 'ignore' });
         return name;
-    } catch (e) {
-        console.log(`Using NPM package for ${name}`);
+    } catch {
         return npmPath;
     }
 };
@@ -20,7 +18,6 @@ const getBinaryPath = (npmPath, name) => {
 ffmpeg.setFfprobePath(getBinaryPath(ffprobe.path, 'ffprobe'));
 ffmpeg.setFfmpegPath(getBinaryPath(ffmpegStatic.path, 'ffmpeg'));
 
-// Standard quality heights (based on the shorter dimension)
 export const RESOLUTIONS = [
     { label: '144p', shortSide: 144, bitrate: '150k' },
     { label: '240p', shortSide: 240, bitrate: '400k' },
@@ -32,36 +29,19 @@ export const RESOLUTIONS = [
 
 export const getVideoMetadata = (source) => {
     return new Promise((resolve, reject) => {
-        let command = ffmpeg(source);
+        ffmpeg(source).ffprobe((err, metadata) => {
+            if (err) return reject(err);
 
-        command.ffprobe((err, metadata) => {
-            if (err) {
-                return reject(err);
-            }
- 
             const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-            if (!videoStream) {
-                return resolve(null);
-            }
+            if (!videoStream) return resolve(null);
 
             const { width, height, duration } = videoStream;
-            
             const shortSide = Math.min(width, height);
-            
-            let resolution = 'SD';
-            if (shortSide >= 2160) resolution = '4K';
-            else if (shortSide >= 1440) resolution = '2K';
-            else if (shortSide >= 1080) resolution = '1080p';
-            else if (shortSide >= 720) resolution = '720p';
-            else if (shortSide >= 480) resolution = '480p';
-            else if (shortSide >= 360) resolution = '360p';
-            else resolution = `${shortSide}p`;
 
             resolve({
                 width,
                 height,
                 shortSide,
-                resolution,
                 duration: parseFloat(duration) || 0,
                 codec: videoStream.codec_name,
                 bitrate: parseInt(videoStream.bit_rate) || 0
@@ -69,35 +49,114 @@ export const getVideoMetadata = (source) => {
         });
     });
 };
-
+ 
 export const transcodeVideo = (source, targetRes) => {
     const passThrough = new PassThrough();
-    
     const scaleFilter = `scale='if(gt(iw,ih),-2,${targetRes.shortSide})':'if(gt(iw,ih),${targetRes.shortSide},-2)'`;
 
-    const command = ffmpeg(source)
+    ffmpeg(source)
         .videoFilters(scaleFilter)
-        .videoBitrate(targetRes.bitrate)
         .format('mp4')
-        .on('start', (cmd) => console.log('FFmpeg command:', cmd))
+        .on('start', (cmd) => console.log(`[${targetRes.label}]`, cmd))
         .on('error', (err) => {
-            if (err.message.includes('Output stream closed')) {
-                console.log(`Note: Stream closed normally for ${targetRes.label}`);
-            } else {
-                console.error('Transcoding error:', err.message);
-                passThrough.destroy(err);
-            }
+            console.error(`Error (${targetRes.label}):`, err.message);
+            passThrough.destroy(err);
         })
-        .on('end', () => console.log('Transcoding finished for', targetRes.label));
-
-    command.outputOptions([
-        '-movflags frag_keyframe+empty_moov+default_base_moof',
-        '-preset veryfast',
-        '-c:a copy' 
-    ]).pipe(passThrough);
+        .on('end', () => console.log(`Done (${targetRes.label})`))
+        .outputOptions([
+            '-c:v libx264',
+            '-preset ultrafast',
+            '-crf 30',
+            // Avoid CPU oversubscription when running multiple encodes/workers.
+            '-threads 1',
+            '-filter_threads 1',
+            '-x264-params threads=1:rc-lookahead=0',
+            '-tune zerolatency',
+            '-movflags frag_keyframe+empty_moov+default_base_moof',
+            '-c:a aac',
+            '-b:a 96k'
+        ])
+        .pipe(passThrough);
 
     return passThrough;
 };
+
+/**
+ * SINGLE-PASS MULTI-RESOLUTION TRANSCODING
+ * Processes all resolutions in one FFmpeg process to save CPU and Time.
+ */
+export const transcodeMultipleResolutions = (source, targets, outputDir) => {
+    return new Promise((resolve, reject) => {
+        if (targets.length === 0) return resolve([]);
+
+        ffmpeg.ffprobe(source, (err, metadata) => {
+            if (err) return reject(err);
+            
+            const hasAudio = metadata.streams.some(s => s.codec_type === 'audio');
+            const command = ffmpeg(source);
+
+            command.outputOptions([
+                '-preset ultrafast',
+                '-crf 30',
+                // Avoid CPU oversubscription when running multiple outputs in one process.
+                '-threads 1',
+                '-filter_threads 1',
+                '-x264-params threads=1:rc-lookahead=0',
+                '-tune zerolatency',
+                '-movflags +faststart'
+            ]);
+
+            if (hasAudio) {
+                command.outputOptions(['-c:a aac', '-b:a 96k']);
+            }
+
+            const filterChain = [];
+            filterChain.push(`[0:v]split=${targets.length}${targets.map((_, i) => `[v${i}]`).join('')}`);
+            
+            if (hasAudio) {
+                filterChain.push(`[0:a]asplit=${targets.length}${targets.map((_, i) => `[a${i}]`).join('')}`);
+            }
+
+            targets.forEach((targetRes, i) => {
+                const scaleFilter = `[v${i}]scale='if(gt(iw,ih),-2,${targetRes.shortSide})':'if(gt(iw,ih),${targetRes.shortSide},-2)'[outv${i}]`;
+                filterChain.push(scaleFilter);
+            });
+
+            command.complexFilter(filterChain);
+
+            const outputFiles = [];
+            targets.forEach((targetRes, i) => {
+                const outPath = path.join(outputDir, `${targetRes.label}_output.mp4`);
+                outputFiles.push({ label: targetRes.label, path: outPath, shortSide: targetRes.shortSide });
+                
+                command
+                    .output(outPath)
+                    .map(`[outv${i}]`)
+                    .videoCodec('libx264')
+                    .videoBitrate(targetRes.bitrate);
+                
+                if (hasAudio) {
+                    command.map(`[a${i}]`);
+                }
+                
+                command.on('start', () => console.log(`Started output for ${targetRes.label}`));
+            });
+
+            command
+                .on('start', (cmd) => console.log('FFmpeg Multi-Output Command:', cmd))
+                .on('error', (err) => {
+                    console.error('Multi-transcoding error:', err.message);
+                    reject(err);
+                })
+                .on('end', () => {
+                    console.log('Finished all resolutions in one pass!');
+                    resolve(outputFiles);
+                })
+                .run();
+        });
+    });
+};
+
 
 export const bufferToStream = (buffer) => {
     const stream = new Readable();

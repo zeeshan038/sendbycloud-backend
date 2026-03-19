@@ -10,7 +10,8 @@ import {
     abortMultipartUpload,
     verifyPassword,
     deleteTransfer,
-    streamVideo
+    streamVideo,
+    speedTest
 } from "../controllers/transfer/transfer.js";
 
 const router = express.Router();
@@ -31,6 +32,7 @@ router.delete("/delete/:id", deleteTransfer);
 router.get("/get-transfer/:shortId", getTransfer);
 router.get("/download/:shortId", getDownloadUrl);
 router.get("/stream/:shortId", streamVideo);
+router.all("/speed-test", speedTest);
 
 
 export default router;

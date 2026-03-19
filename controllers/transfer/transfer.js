@@ -19,7 +19,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Upload } from "@aws-sdk/lib-storage";
 import archiver from "archiver";
 import { PassThrough } from "stream";
-import { getVideoMetadata, RESOLUTIONS, transcodeVideo } from "../../utils/videoProcessor.js";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { getVideoMetadata, RESOLUTIONS, transcodeVideo, transcodeMultipleResolutions } from "../../utils/videoProcessor.js";
+
 
 //Models
 import File from "../../models/files.js";
@@ -90,8 +94,7 @@ const extractVideoResolutions = async (transferId, files) => {
         if (!transfer) return;
 
         const updatedFiles = transfer.files;
-        let hasChanges = false;
-
+        
         for (let i = 0; i < updatedFiles.length; i++) {
             const fileData = updatedFiles[i];
             const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
@@ -101,7 +104,7 @@ const extractVideoResolutions = async (transferId, files) => {
             if (!isVideo) continue;
 
             try {
-                // Generate a temporary signed URL for ffprobe to hit
+                // Generate a temporary signed URL for ffprobe and ffmpeg
                 const getCommand = new GetObjectCommand({
                     Bucket: process.env.R2_BUCKET_NAME,
                     Key: objectKey,
@@ -109,87 +112,178 @@ const extractVideoResolutions = async (transferId, files) => {
                 const signedUrl = await getSignedUrl(r2Client, getCommand, { expiresIn: 3600 });
 
                 const metadata = await getVideoMetadata(signedUrl);
-                if (metadata && metadata.resolution) {
-                    // Set initial metadata
-                    if (typeof updatedFiles[i] === 'string') {
-                        updatedFiles[i] = {
-                            key: objectKey,
-                            resolution: metadata.resolution,
-                            duration: metadata.duration,
-                            qualities: [{ label: 'Original', key: objectKey, isOriginal: true }]
-                        };
-                    } else {
-                        updatedFiles[i].resolution = metadata.resolution;
-                        updatedFiles[i].duration = metadata.duration;
-                        updatedFiles[i].metadata = metadata;
-                        if (!updatedFiles[i].qualities) {
-                            updatedFiles[i].qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
-                        }
+                if (metadata && metadata.shortSide) {
+                    // Update metadata immediately
+                    const fileToUpdate = typeof updatedFiles[i] === 'string' ? { key: objectKey } : updatedFiles[i];
+                    fileToUpdate.resolution = `${metadata.shortSide}p`;
+                    fileToUpdate.duration = metadata.duration;
+                    fileToUpdate.metadata = metadata;
+                    if (!fileToUpdate.qualities) {
+                        fileToUpdate.qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
                     }
                     
-                    // Save initial metadata immediately
-                    await File.findByIdAndUpdate(transferId, { files: updatedFiles });
-                    console.log(`Initial metadata stored for ${objectKey}`);
+                    await File.updateOne(
+                        { _id: transferId },
+                        { $set: { [`files.${i}`]: fileToUpdate } }
+                    );
 
-                    const currentShortSide = metadata.shortSide;
-                    const targets = RESOLUTIONS.filter(r => r.shortSide < currentShortSide); 
+                    const targets = RESOLUTIONS.filter(r => r.shortSide < metadata.shortSide);
+                    if (targets.length === 0) continue;
 
-                    // Process each target resolution
-                    for (const targetRes of targets) {
-                        try {
+                    // Create temp directory for this transcoding job
+                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcode-'));
+                    
+                    try {
+                        console.log(`Starting multi-resolution transcoding for ${objectKey} in ${tempDir}`);
+                        const outputFiles = await transcodeMultipleResolutions(signedUrl, targets, tempDir);
+
+                        // Upload all generated files in parallel
+                        await Promise.all(outputFiles.map(async (outFile) => {
                             const pathParts = objectKey.split('/');
                             const fileName = pathParts.pop();
                             const folderPath = pathParts.join('/');
-                            const resKey = `${folderPath}/${targetRes.label}_${fileName}`;
-                            
-                            console.log(`Starting transcoding: ${targetRes.label} for ${fileName}`);
-                            const transcodeStream = transcodeVideo(signedUrl, targetRes);
-                            
+                            const resKey = `${folderPath}/${outFile.label}_${fileName}`;
+
+                            const fileStream = fs.createReadStream(outFile.path);
                             const upload = new Upload({
                                 client: r2Client,
                                 params: {
                                     Bucket: process.env.R2_BUCKET_NAME,
                                     Key: resKey,
-                                    Body: transcodeStream,
+                                    Body: fileStream,
                                     ContentType: 'video/mp4'
                                 }
                             });
 
                             await upload.done();
+                            console.log(`Uploaded ${outFile.label} to R2`);
 
-                            // Update the qualities array in the DB incrementally
-                            const currentTransfer = await File.findById(transferId);
-                            if (currentTransfer) {
-                                const fileToUpdate = currentTransfer.files[i];
-                                if (fileToUpdate && fileToUpdate.qualities) {
-                                    // Check if already exists to avoid duplicates
-                                    if (!fileToUpdate.qualities.some(q => q.label === targetRes.label)) {
-                                        fileToUpdate.qualities.push({
-                                            label: targetRes.label,
+                            // Update qualities in DB
+                            await File.updateOne(
+                                { _id: transferId },
+                                { 
+                                    $push: { 
+                                        [`files.${i}.qualities`]: {
+                                            label: outFile.label,
                                             key: resKey,
                                             isOriginal: false
-                                        });
-                                        
-                                        // Update specifically this file in the array
-                                        await File.updateOne(
-                                            { _id: transferId },
-                                            { $set: { [`files.${i}`]: fileToUpdate } }
-                                        );
-                                        console.log(`Incremental update: Added ${targetRes.label} to ${objectKey}`);
-                                    }
+                                        }
+                                    } 
                                 }
-                            }
-                        } catch (transErr) {
-                            console.error(`Transcoding failed for ${targetRes.label}:`, transErr.message);
+                            );
+                        }));
+                    } finally {
+                        // Cleanup temp files
+                        try {
+                            fs.rmSync(tempDir, { recursive: true, force: true });
+                            console.log(`Cleaned up temp directory: ${tempDir}`);
+                        } catch (cleanupErr) {
+                            console.error(`Error cleaning up ${tempDir}:`, cleanupErr.message);
                         }
                     }
                 }
             } catch (err) {
-                console.warn(`Could not probe video ${objectKey}`, err.message);
+                console.warn(`Could not process video ${objectKey}`, err.message);
             }
         }
     } catch (error) {
         console.error("Error in extractVideoResolutions:", error);
+    }
+};
+
+
+/**
+ * @Description Upload Speed test
+ * @Route POST api/file/speed-test
+ * @Access Public
+ */
+/**
+ * @Description Network Speed test (Latency, Download, Upload)
+ * @Route ALL api/transfer/speed-test
+ * @Access Public
+ */
+export const speedTest = async (req, res) => {
+    try {
+        if (req.method === 'GET') {
+            const { download, size } = req.query;
+            
+            // If download requested, send binary data
+            if (download === 'true') {
+                const downloadSize = parseInt(size) || 1024 * 1024 * 5; // Default 5MB
+                
+                // Cap at 100MB to prevent abuse
+                if (downloadSize > 100 * 1024 * 1024) {
+                    return res.status(400).json({ 
+                        status: false, 
+                        msg: "Download size too large (max 100MB)" 
+                    });
+                }
+                
+                res.setHeader('Content-Type', 'application/octet-stream');
+                res.setHeader('Content-Length', downloadSize);
+                res.setHeader('Content-Disposition', 'attachment; filename="speedtest.bin"');
+                
+                // Stream chunks of zeros to minimize memory usage
+                const chunkSize = 64 * 1024;
+                let sent = 0;
+                
+                while (sent < downloadSize) {
+                    const toSend = Math.min(chunkSize, downloadSize - sent);
+                    // Using a single buffer repeatedly would be even better, 
+                    // but for simplicity and safety against modifications:
+                    res.write(Buffer.alloc(toSend, 0));
+                    sent += toSend;
+                }
+                return res.end();
+            }
+
+            // Normal GET: Latency/Ping test
+            return res.status(200).json({ 
+                status: true, 
+                msg: "Server is ready for speed test",
+                timestamp: Date.now()
+            });
+
+        } else if (req.method === 'POST') {
+            // Upload test: Measure how much data we receive
+            let bytesReceived = 0;
+            
+            // Note: If express.json() or other body parsers are used, 
+            // they may have already consumed the stream if the Content-Type matched.
+            // For raw speed tests, clients should send application/octet-stream.
+            
+            req.on('data', (chunk) => {
+                bytesReceived += chunk.length;
+            });
+
+            req.on('end', () => {
+                // If bytesReceived is 0, it might be because a body-parser already consumed it
+                // and put it in req.body (though for binary data that's unlikely unless configured).
+                // Or simply no data was sent.
+                
+                return res.status(200).json({
+                    status: true,
+                    msg: "Upload test completed",
+                    bytesReceived: bytesReceived || (req.body ? JSON.stringify(req.body).length : 0),
+                    timestamp: Date.now()
+                });
+            });
+
+            // Handle stream errors
+            req.on('error', (err) => {
+                console.error("Upload test stream error:", err);
+                if (!res.headersSent) {
+                    res.status(500).json({ status: false, msg: "Stream error during upload test" });
+                }
+            });
+        } else {
+            return res.status(405).json({ status: false, msg: "Method not allowed" });
+        }
+    } catch (error) {
+        console.error("Speed test general error:", error);
+        if (!res.headersSent) {
+            return res.status(500).json({ status: false, msg: error.message });
+        }
     }
 };
 
