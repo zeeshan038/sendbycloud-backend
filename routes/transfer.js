@@ -3,7 +3,6 @@ import {
     sendFile, 
     generateUploadUrls,
     getTransfer, 
-    getDownloadUrl,
     initiateMultipartUpload,
     getPartUploadUrl,
     completeMultipartUpload,
@@ -13,13 +12,15 @@ import {
     streamVideo,
     speedTest
 } from "../controllers/transfer/transfer.js";
+import { optionalVerifyUser } from "../middlewares/verifyUser.js";
 
 const router = express.Router();
 
+router.use(optionalVerifyUser);
 router.post("/send", sendFile);
 router.post("/generate-upload-urls", generateUploadUrls);
 
-// Multipart Upload Routes
+ // Multipart Upload Routes
 router.post("/initiate-multipart", initiateMultipartUpload);
 router.post("/get-part-url", getPartUploadUrl);
 router.post("/complete-multipart", completeMultipartUpload);
@@ -30,9 +31,13 @@ router.post("/verify-password/:shortId", verifyPassword);
 router.delete("/delete/:id", deleteTransfer);
 
 router.get("/get-transfer/:shortId", getTransfer);
-router.get("/download/:shortId", getDownloadUrl);
+
+// Stream Routes
 router.get("/stream/:shortId", streamVideo);
-router.all("/speed-test", speedTest);
+
+// Speed Test Route
+router.all("/speed-test",express.raw({ type: '*/*', limit: '200mb' }), speedTest);
 
 
 export default router;
+

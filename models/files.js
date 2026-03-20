@@ -4,8 +4,7 @@ import { nanoid } from "nanoid";
 const fileSchema = new mongoose.Schema({
     user: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "User",
-        required: false,
+        ref: "User"
     },
     senderEmail: {
         type: String,

@@ -94,7 +94,7 @@ const extractVideoResolutions = async (transferId, files) => {
         if (!transfer) return;
 
         const updatedFiles = transfer.files;
-        
+
         for (let i = 0; i < updatedFiles.length; i++) {
             const fileData = updatedFiles[i];
             const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
@@ -121,7 +121,7 @@ const extractVideoResolutions = async (transferId, files) => {
                     if (!fileToUpdate.qualities) {
                         fileToUpdate.qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
                     }
-                    
+
                     await File.updateOne(
                         { _id: transferId },
                         { $set: { [`files.${i}`]: fileToUpdate } }
@@ -132,7 +132,7 @@ const extractVideoResolutions = async (transferId, files) => {
 
                     // Create temp directory for this transcoding job
                     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcode-'));
-                    
+
                     try {
                         console.log(`Starting multi-resolution transcoding for ${objectKey} in ${tempDir}`);
                         const outputFiles = await transcodeMultipleResolutions(signedUrl, targets, tempDir);
@@ -161,14 +161,14 @@ const extractVideoResolutions = async (transferId, files) => {
                             // Update qualities in DB
                             await File.updateOne(
                                 { _id: transferId },
-                                { 
-                                    $push: { 
+                                {
+                                    $push: {
                                         [`files.${i}.qualities`]: {
                                             label: outFile.label,
                                             key: resKey,
                                             isOriginal: false
                                         }
-                                    } 
+                                    }
                                 }
                             );
                         }));
@@ -204,97 +204,123 @@ const extractVideoResolutions = async (transferId, files) => {
  */
 export const speedTest = async (req, res) => {
     try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Surrogate-Control', 'no-store');
+
         if (req.method === 'GET') {
             const { download, size } = req.query;
-            
-            // If download requested, send binary data
+
             if (download === 'true') {
-                const downloadSize = parseInt(size) || 1024 * 1024 * 5; // Default 5MB
-                
-                // Cap at 100MB to prevent abuse
-                if (downloadSize > 100 * 1024 * 1024) {
-                    return res.status(400).json({ 
-                        status: false, 
-                        msg: "Download size too large (max 100MB)" 
+                const parsedSize = Number(size);
+                const downloadSize = Number.isFinite(parsedSize) && parsedSize > 0
+                    ? parsedSize
+                    : 5 * 1024 * 1024; // default 5MB
+
+                const maxSize = 100 * 1024 * 1024; // 100MB
+                if (downloadSize > maxSize) {
+                    return res.status(400).json({
+                        status: false,
+                        msg: 'Download size too large (max 100MB)'
                     });
                 }
-                
+
+                res.status(200);
                 res.setHeader('Content-Type', 'application/octet-stream');
-                res.setHeader('Content-Length', downloadSize);
+                res.setHeader('Content-Length', String(downloadSize));
                 res.setHeader('Content-Disposition', 'attachment; filename="speedtest.bin"');
-                
-                // Stream chunks of zeros to minimize memory usage
+
                 const chunkSize = 64 * 1024;
+                const zeroChunk = Buffer.alloc(chunkSize, 0);
                 let sent = 0;
-                
-                while (sent < downloadSize) {
-                    const toSend = Math.min(chunkSize, downloadSize - sent);
-                    // Using a single buffer repeatedly would be even better, 
-                    // but for simplicity and safety against modifications:
-                    res.write(Buffer.alloc(toSend, 0));
-                    sent += toSend;
-                }
-                return res.end();
+
+                const writeChunk = () => {
+                    while (sent < downloadSize) {
+                        const remaining = downloadSize - sent;
+                        const currentChunk =
+                            remaining >= chunkSize ? zeroChunk : zeroChunk.subarray(0, remaining);
+
+                        const canContinue = res.write(currentChunk);
+                        sent += currentChunk.length;
+
+                        if (!canContinue) {
+                            res.once('drain', writeChunk);
+                            return;
+                        }
+                    }
+
+                    res.end();
+                };
+
+                writeChunk();
+                return;
             }
 
-            // Normal GET: Latency/Ping test
-            return res.status(200).json({ 
-                status: true, 
-                msg: "Server is ready for speed test",
+            return res.status(200).json({
+                status: true,
+                msg: 'Server is ready for speed test',
                 timestamp: Date.now()
             });
+        }
 
-        } else if (req.method === 'POST') {
-            // Upload test: Measure how much data we receive
+        if (req.method === 'POST') {
+            const contentLengthHeader = req.headers['content-length'];
+            const contentLength = contentLengthHeader ? Number(contentLengthHeader) : null;
+
             let bytesReceived = 0;
-            
-            // Note: If express.json() or other body parsers are used, 
-            // they may have already consumed the stream if the Content-Type matched.
-            // For raw speed tests, clients should send application/octet-stream.
-            
+
             req.on('data', (chunk) => {
                 bytesReceived += chunk.length;
             });
 
             req.on('end', () => {
-                // If bytesReceived is 0, it might be because a body-parser already consumed it
-                // and put it in req.body (though for binary data that's unlikely unless configured).
-                // Or simply no data was sent.
-                
                 return res.status(200).json({
                     status: true,
-                    msg: "Upload test completed",
-                    bytesReceived: bytesReceived || (req.body ? JSON.stringify(req.body).length : 0),
+                    msg: 'Upload test completed',
+                    bytesReceived,
+                    contentLength: Number.isFinite(contentLength) ? contentLength : null,
                     timestamp: Date.now()
                 });
             });
 
-            // Handle stream errors
             req.on('error', (err) => {
-                console.error("Upload test stream error:", err);
+                console.error('Upload test stream error:', err);
                 if (!res.headersSent) {
-                    res.status(500).json({ status: false, msg: "Stream error during upload test" });
+                    return res.status(500).json({
+                        status: false,
+                        msg: 'Stream error during upload test'
+                    });
                 }
             });
-        } else {
-            return res.status(405).json({ status: false, msg: "Method not allowed" });
+
+            return;
         }
+
+        return res.status(405).json({
+            status: false,
+            msg: 'Method not allowed'
+        });
     } catch (error) {
-        console.error("Speed test general error:", error);
+        console.error('Speed test general error:', error);
         if (!res.headersSent) {
-            return res.status(500).json({ status: false, msg: error.message });
+            return res.status(500).json({
+                status: false,
+                msg: error.message || 'Internal server error'
+            });
         }
     }
 };
 
-export const sendFile = async (req, res) => {
-    const { getShareableLink = false, selfDestruct = false , isDownloadAble = false } = req.query;
+export const sendFile = async (req, res) => { 
+   const userId = req.user?._id ?? null;
+    const { getShareableLink = false, selfDestruct = false, isDownloadAble = false } = req.query;
     const payload = req.body;
 
     // Validation
     const { error } = TransferSchema(payload);
     if (error) {
-        return res.status(400).json({
+        return res.status(400).json({ 
             status: false,
             msg: error.details[0].message
         });
@@ -318,7 +344,7 @@ export const sendFile = async (req, res) => {
     try {
 
         const file = await File.create({
-            user: req.body.user || null,
+            user: userId,
             senderEmail,
             recevierEmails,
             files,
@@ -335,6 +361,7 @@ export const sendFile = async (req, res) => {
         });
 
         const shareLink = `${process.env.CLIENT_URL}/${file.shortId}`;
+        
 
         // If multiple files, create zip in background
         if (files.length > 1) {
@@ -388,10 +415,10 @@ export const generateUploadUrls = async (req, res) => {
         const transferId = existingId || nanoid(8);
         console.log("Generating upload URLs for transfer:", transferId);
 
+        const folderPrefix = process.env.R2_FOLDER ? `${process.env.R2_FOLDER}/` : "";
         const uploadUrls = await Promise.all(
             files.map(async (file) => {
                 const safeName = sanitizeFileName(file.fileName);
-                const folderPrefix = process.env.R2_FOLDER ? `${process.env.R2_FOLDER}/` : "";
                 const objectKey = `${folderPrefix}transfers/${transferId}/${safeName}`;
 
                 const command = new PutObjectCommand({
@@ -401,7 +428,6 @@ export const generateUploadUrls = async (req, res) => {
                 });
 
                 const url = await getSignedUrl(r2Client, command, { expiresIn: 10800 });
-                console.log(url);
                 return {
                     originalName: file.fileName,
                     objectKey,
@@ -409,7 +435,6 @@ export const generateUploadUrls = async (req, res) => {
                 };
             })
         );
-        console.log(uploadUrls);
         return res.status(200).json({
             status: true,
             msg: "Presigned URLs generated successfully",
@@ -602,150 +627,6 @@ export const getTransfer = async (req, res) => {
     }
 };
 
-/**
- * @Description Get download links for a transfer
- * @Route GET api/transfer/download/:id
- * @Access Public
- */
-export const getDownloadUrl = async (req, res) => {
-    const { shortId } = req.params;
-    const { preview = false, password = "" } = req.query;
-    try {
-        // Find by shortId or standard MongoDB ID
-        const isObjectId = mongoose.Types.ObjectId.isValid(shortId);
-        const transfer = await File.findOne(
-            isObjectId ? { _id: shortId } : { shortId: shortId }
-        );
-
-        if (!transfer) {
-            return res.status(404).json({
-                status: false,
-                msg: "Transfer not found"
-            });
-        }
-
-        // Check password if set
-        if (transfer.password && transfer.password !== password) {
-            return res.status(401).json({
-                status: false,
-                msg: "Invalid password for this transfer"
-            });
-        }
-
-        // Check self-destruct logic: Only block if it's NOT a preview or if it already reached the limit
-        if (transfer.selfDestruct && transfer.downloadCount >= 1) {
-            return res.status(410).json({
-                status: false,
-                msg: "This transfer has self-destructed and is no longer available."
-            });
-        }
-
-        // Generate signed URLs for each file in the transfer
-        const fileUrls = await Promise.all(
-            transfer.files.map(async (fileData) => {
-                // Handle both cases: fileData is a string (old way) or an object (new way)
-                const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
-
-                // Extract original name (everything after the first underscore)
-                const originalName = typeof fileData === 'object' && fileData.name
-                    ? fileData.name
-                    : (objectKey.split('_').slice(1).join('_') || objectKey);
-
-                const command = new GetObjectCommand({
-                    Bucket: process.env.R2_BUCKET_NAME,
-                    Key: objectKey,
-                    // This is the "magic" string that forces a direct download with the original name
-                    ResponseContentDisposition: preview === 'true'
-                        ? 'inline'
-                        : `attachment; filename="${originalName}"; filename*=UTF-8''${encodeURIComponent(originalName)}`
-                });
-
-                // URL valid for 7 days (standard for file sharing)
-                const url = await getSignedUrl(r2Client, command, { expiresIn: 604800 });
-
-                // Generate signed URLs for all qualities
-                let qualityUrls = [];
-                if (fileData.qualities && Array.isArray(fileData.qualities)) {
-                    qualityUrls = await Promise.all(
-                        fileData.qualities.map(async (q) => {
-                            const qCommand = new GetObjectCommand({
-                                Bucket: process.env.R2_BUCKET_NAME,
-                                Key: q.key,
-                                ResponseContentDisposition: preview === 'true'
-                                    ? 'inline'
-                                    : `attachment; filename="${q.label}_${originalName}"`
-                            });
-                            const qUrl = await getSignedUrl(r2Client, qCommand, { expiresIn: 604800 });
-                            return {
-                                label: q.label,
-                                url: qUrl,
-                                isOriginal: q.isOriginal
-                            };
-                        })
-                    );
-                }
-
-                return {
-                    objectKey,
-                    url,
-                    fileName: originalName,
-                    qualities: qualityUrls.length > 0 ? qualityUrls : null,
-                    resolution: fileData.resolution || null,
-                    duration: fileData.duration || null,
-                    streamUrl: /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName) 
-                        ?process.env.BACKEND_URL||`${'http://localhost:8080'}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
-                        : null
-                };
-            })
-        );
-
-        let zipUrl = null;
-        let zipStatus = "none";
-
-        if (transfer.files.length > 1) {
-            if (transfer.zipKey) {
-                const zipCommand = new GetObjectCommand({
-                    Bucket: process.env.R2_BUCKET_NAME,
-                    Key: transfer.zipKey,
-                    ResponseContentDisposition: `attachment; filename="all_files.zip"`
-                });
-                zipUrl = await getSignedUrl(r2Client, zipCommand, { expiresIn: 604800 });
-                zipStatus = "ready";
-            } else {
-                zipStatus = "processing";
-            }
-        }
-
-
-        // ONLY increment downloadCount if this is a real download, NOT a preview
-        if (preview !== 'true') {
-            transfer.downloadCount += 1;
-            await transfer.save();
-        }
-
-        return res.status(200).json({
-            status: true,
-            files: fileUrls,
-            zipUrl,
-            zipStatus,
-            isSelfDestruct: transfer.selfDestruct,
-            isDownloadAble: transfer.isDownloadAble,
-            transferDetails: {
-                senderEmail: transfer.senderEmail,
-                recevierEmails: transfer.recevierEmails,
-                totalSize: transfer.totalSize,
-                expireIn: transfer.expireIn,
-            }
-        });
-
-    } catch (error) {
-        console.error("Error fetching download URLs:", error);
-        return res.status(500).json({
-            status: false,
-            msg: error.message
-        });
-    }
-};
 
 /**
  * @Description Verify transfer password
@@ -922,7 +803,7 @@ export const streamVideo = async (req, res) => {
                 'Content-Length': fileSize,
                 'Content-Type': metadata.ContentType || 'video/mp4',
             });
-            
+
             const fileCommand = new GetObjectCommand({
                 Bucket: process.env.R2_BUCKET_NAME,
                 Key: key,
@@ -936,11 +817,11 @@ export const streamVideo = async (req, res) => {
         } else {
             console.error("Streaming error:", error);
         }
-        
+
         if (!res.headersSent) {
-            res.status(error.name === 'NotFound' ? 404 : 500).json({ 
-                status: false, 
-                msg: error.name === 'NotFound' ? "File not found on storage server" : error.message 
+            res.status(error.name === 'NotFound' ? 404 : 500).json({
+                status: false,
+                msg: error.name === 'NotFound' ? "File not found on storage server" : error.message
             });
         }
     }

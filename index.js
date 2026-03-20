@@ -7,7 +7,7 @@ const app = express();
 //CORS
 app.use(cors(
   {
-    origin: ["http://localhost:5173", "https://send-v-2.vercel.app"],
+    origin: ["http://localhost:5173", process.env.CLIENT_URL].filter(Boolean),
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"]
@@ -33,3 +33,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Your app is running on PORT ${PORT}`);
 });
+ 
