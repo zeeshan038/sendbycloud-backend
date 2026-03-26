@@ -2,7 +2,14 @@
 import mongoose from "mongoose";
 import { nanoid } from "nanoid";
 
-//utils
+//Models
+import File from "../../models/files.js";
+
+//schema
+import { TransferSchema, VerifyPasswordSchema } from "../../schema/Transfer.js";
+
+// utils
+import { createZipAndUpload, extractVideoResolutions, calculateExpireDate } from "../../utils/methods.js";
 import r2Client from "../../utils/R2.js";
 import {
     PutObjectCommand,
@@ -16,187 +23,8 @@ import {
 } from "@aws-sdk/client-s3";
 import { sanitizeFileName } from "../../utils/methods.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { Upload } from "@aws-sdk/lib-storage";
-import archiver from "archiver";
-import { PassThrough } from "stream";
-import fs from "fs";
-import path from "path";
-import os from "os";
-import { getVideoMetadata, RESOLUTIONS, transcodeVideo, transcodeMultipleResolutions } from "../../utils/videoProcessor.js";
+import { sendEmail, buildFileReceivedHtml } from "../../utils/Nodemailer.js";
 
-
-//Models
-import File from "../../models/files.js";
-
-//schema
-import { TransferSchema, VerifyPasswordSchema } from "../../schema/Transfer.js";
-
-/**
- * @Description Send File to the user 
- * @Route POST api/file/Send
- * @Access Public OR Private
- */
-
-const createZipAndUpload = async (transferId, files, shortId) => {
-    try {
-        const archive = archiver('zip', {
-            zlib: { level: 9 }
-        });
-
-        const passThrough = new PassThrough();
-        const folderPrefix = process.env.R2_FOLDER ? `${process.env.R2_FOLDER}/` : "";
-        const zipKey = `${folderPrefix}transfers/sendbycloud-${shortId}.zip`;
-
-        const upload = new Upload({
-            client: r2Client,
-            params: {
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: zipKey,
-                Body: passThrough,
-                ContentType: 'application/zip'
-            }
-        });
-
-        archive.pipe(passThrough);
-
-        for (const fileData of files) {
-            const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
-            const originalName = typeof fileData === 'object' && fileData.name
-                ? fileData.name
-                : (objectKey.split('_').slice(1).join('_') || objectKey);
-
-            const getObjectCommand = new GetObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: objectKey,
-            });
-
-            const response = await r2Client.send(getObjectCommand);
-            const entryName = files.length > 1 ? `Files/${originalName}` : originalName;
-            archive.append(response.Body, { name: entryName });
-            console.log(`Added ${originalName} to zip`);
-        }
-
-        archive.finalize();
-
-        await upload.done();
-
-        // Update transfer with zipKey
-        await File.findByIdAndUpdate(transferId, { zipKey });
-        console.log(`Zip created and uploaded for transfer ${transferId}: ${zipKey}`);
-    } catch (error) {
-        console.error("Error creating zip:", error);
-    }
-};
-
-const extractVideoResolutions = async (transferId, files) => {
-    try {
-        const transfer = await File.findById(transferId);
-        if (!transfer) return;
-
-        const updatedFiles = transfer.files;
-
-        for (let i = 0; i < updatedFiles.length; i++) {
-            const fileData = updatedFiles[i];
-            const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
-
-            // Check if it's a video by extension
-            const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(objectKey);
-            if (!isVideo) continue;
-
-            try {
-                // Generate a temporary signed URL for ffprobe and ffmpeg
-                const getCommand = new GetObjectCommand({
-                    Bucket: process.env.R2_BUCKET_NAME,
-                    Key: objectKey,
-                });
-                const signedUrl = await getSignedUrl(r2Client, getCommand, { expiresIn: 3600 });
-
-                const metadata = await getVideoMetadata(signedUrl);
-                if (metadata && metadata.shortSide) {
-                    // Update metadata immediately
-                    const fileToUpdate = typeof updatedFiles[i] === 'string' ? { key: objectKey } : updatedFiles[i];
-                    fileToUpdate.resolution = `${metadata.shortSide}p`;
-                    fileToUpdate.duration = metadata.duration;
-                    fileToUpdate.metadata = metadata;
-                    if (!fileToUpdate.qualities) {
-                        fileToUpdate.qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
-                    }
-
-                    await File.updateOne(
-                        { _id: transferId },
-                        { $set: { [`files.${i}`]: fileToUpdate } }
-                    );
-
-                    const targets = RESOLUTIONS.filter(r => r.shortSide < metadata.shortSide);
-                    if (targets.length === 0) continue;
-
-                    // Create temp directory for this transcoding job
-                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcode-'));
-
-                    try {
-                        console.log(`Starting multi-resolution transcoding for ${objectKey} in ${tempDir}`);
-                        const outputFiles = await transcodeMultipleResolutions(signedUrl, targets, tempDir);
-
-                        // Upload all generated files in parallel
-                        await Promise.all(outputFiles.map(async (outFile) => {
-                            const pathParts = objectKey.split('/');
-                            const fileName = pathParts.pop();
-                            const folderPath = pathParts.join('/');
-                            const resKey = `${folderPath}/${outFile.label}_${fileName}`;
-
-                            const fileStream = fs.createReadStream(outFile.path);
-                            const upload = new Upload({
-                                client: r2Client,
-                                params: {
-                                    Bucket: process.env.R2_BUCKET_NAME,
-                                    Key: resKey,
-                                    Body: fileStream,
-                                    ContentType: 'video/mp4'
-                                }
-                            });
-
-                            await upload.done();
-                            console.log(`Uploaded ${outFile.label} to R2`);
-
-                            // Update qualities in DB
-                            await File.updateOne(
-                                { _id: transferId },
-                                {
-                                    $push: {
-                                        [`files.${i}.qualities`]: {
-                                            label: outFile.label,
-                                            key: resKey,
-                                            isOriginal: false
-                                        }
-                                    }
-                                }
-                            );
-                        }));
-                    } finally {
-                        // Cleanup temp files
-                        try {
-                            fs.rmSync(tempDir, { recursive: true, force: true });
-                            console.log(`Cleaned up temp directory: ${tempDir}`);
-                        } catch (cleanupErr) {
-                            console.error(`Error cleaning up ${tempDir}:`, cleanupErr.message);
-                        }
-                    }
-                }
-            } catch (err) {
-                console.warn(`Could not process video ${objectKey}`, err.message);
-            }
-        }
-    } catch (error) {
-        console.error("Error in extractVideoResolutions:", error);
-    }
-};
-
-
-/**
- * @Description Upload Speed test
- * @Route POST api/file/speed-test
- * @Access Public
- */
 /**
  * @Description Network Speed test (Latency, Download, Upload)
  * @Route ALL api/transfer/speed-test
@@ -312,15 +140,24 @@ export const speedTest = async (req, res) => {
     }
 };
 
-export const sendFile = async (req, res) => { 
-   const userId = req.user?._id ?? null;
-    const { getShareableLink = false, selfDestruct = false, isDownloadAble = false } = req.query;
+/**
+ * @Description Send File
+ * @Route POST api/transfer/send-file
+ * @Access Private
+ */
+export const sendFile = async (req, res) => {
+    const userId = req.user?._id ?? null;
+    const {
+        getShareableLink = false,
+        selfDestruct = false,
+        isDownloadAble = false
+    } = req.query;
     const payload = req.body;
 
     // Validation
     const { error } = TransferSchema(payload);
     if (error) {
-        return res.status(400).json({ 
+        return res.status(400).json({
             status: false,
             msg: error.details[0].message
         });
@@ -342,6 +179,7 @@ export const sendFile = async (req, res) => {
     } = payload;
 
     try {
+        const finalExpireDate = expireDate || calculateExpireDate(expireIn);
 
         const file = await File.create({
             user: userId,
@@ -351,7 +189,7 @@ export const sendFile = async (req, res) => {
             totalSize,
             uploadType,
             password,
-            expireDate,
+            expireDate: finalExpireDate,
             downloadLimit,
             expireIn,
             background,
@@ -361,7 +199,7 @@ export const sendFile = async (req, res) => {
         });
 
         const shareLink = `${process.env.CLIENT_URL}/${file.shortId}`;
-        
+
 
         // If multiple files, create zip in background
         if (files.length > 1) {
@@ -385,6 +223,30 @@ export const sendFile = async (req, res) => {
                 shareLink
             });
         }
+
+        const fileCount = files.length;
+        const subject = `${senderEmail} shared ${fileCount} file${fileCount > 1 ? "s" : ""} with you via SendByCloud`;
+        const formattedExpireDate = expireDate
+            ? new Date(expireDate).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
+            : "N/A";
+
+        const text = `${senderEmail} shared ${fileCount} file${fileCount > 1 ? "s" : ""} with you via SendByCloud.\n\nDownload: ${shareLink}\n\nThis link expires on: ${formattedExpireDate}`;
+
+        // send email to receiver
+        await sendEmail({
+            to: recevierEmails,
+            subject,
+            text,
+            html: buildFileReceivedHtml({
+                senderEmail,
+                shareLink,
+                fileCount: files.length,
+                totalSize: totalSize,
+                expireDate: expireDate,
+                clientUrl: process.env.CLIENT_URL,
+            }),
+        });
+
 
         return res.status(200).json({
             status: true,

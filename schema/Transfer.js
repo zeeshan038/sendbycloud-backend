@@ -12,6 +12,7 @@ export const TransferSchema = (payload) => {
             "array.min": "At least one file is required",
         }),
         totalSize: Joi.number().required(),
+        message: Joi.string().allow("", null),
         uploadType: Joi.string().valid("File", "Folder", "Videos").default("File"),
         password: Joi.string().allow("", null),
         expireDate: Joi.date().iso().allow(null),

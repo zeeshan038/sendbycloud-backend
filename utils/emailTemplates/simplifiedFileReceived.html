@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 20px auto; padding: 20px; border: 1px solid #eee; border-radius: 8px; }
+        .button { display: inline-block; padding: 12px 24px; background-color: #4f46e5; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-weight: bold; }
+        .footer { margin-top: 30px; font-size: 12px; color: #666; border-top: 1px solid #eee; padding-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>File shared with you</h2>
+        <p>A file has been shared with you via SendByCloud.</p>
+        <p><strong>From:</strong> {{SENDER_EMAIL}}</p>
+        <p><strong>Files:</strong> {{FILE_COUNT}}</p>
+        <p><strong>Total Size:</strong> {{TOTAL_SIZE}}</p>
+        <p><strong>Expires on:</strong> {{EXPIRE_DATE}}</p>
+        <p style="margin-top: 30px;">
+            <a href="{{SHARE_LINK}}" class="button">Download Files</a>
+        </p>
+        <p style="font-size: 11px; color: #999;">Or copy this link: {{SHARE_LINK}}</p>
+        <div class="footer">
+            <p>&copy; 2025 SendByCloud. All rights reserved.</p>
+        </div>
+    </div>
+</body>
+</html>

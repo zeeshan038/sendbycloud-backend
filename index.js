@@ -1,18 +1,48 @@
 import "dotenv/config";
 import express from "express";
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION! 💥 Shutting down...");
+  console.error(err.name, err.message, err.stack);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION! 💥 Shutting down...");
+  console.error(err.name, err.message, err.stack);
+  process.exit(1);
+});
 import cors from "cors";
 
-const app = express();
+import { startCleanupJob } from "./utils/cleanup.js";
 
-//CORS
+const app = express();
+startCleanupJob();
+
+// Log incoming request origin
+app.use((req, res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.url} | Origin: ${req.headers.origin || "None"}`);
+  next();
+});
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://sendbycloud.com",
+  "https://app.sendbycloud.com"
+].filter(Boolean);
+
 app.use(cors(
   {
-    origin: ["http://localhost:5173", process.env.CLIENT_URL].filter(Boolean),
+    origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"]
   }
 ));
+
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: true, msg: "Server is healthy and CORS is working" });
+});
 
 //Project files and routes
 import connectDb from "./config/db.js";
@@ -23,13 +53,13 @@ import apiRouter from "./routes/index.js";
 app.use(express.json({ limit: "500mb" }));
 
 //connect to database 
-connectDb();
+connectDb(); 
 
 //Connecting routes
 app.use("/api", apiRouter);
 
 //Connect Server
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Your app is running on PORT ${PORT}`);
 });

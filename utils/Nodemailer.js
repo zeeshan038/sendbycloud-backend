@@ -1,4 +1,9 @@
 import nodemailer from "nodemailer";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const port = Number(process.env.SMTP_PORT);
 const secure =
@@ -14,6 +19,15 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+});
+
+// Verify SMTP connection
+transporter.verify((error, success) => {
+  if (error) {
+    console.error("SMTP Connection Error:", error);
+  } else {
+    console.log("SMTP Server is ready to take our messages");
+  }
 });
 
 /**
@@ -34,14 +48,70 @@ export const sendEmail = async ({
   if (!process.env.SMTP_PORT) throw new Error("Missing SMTP_PORT");
   if (!to) throw new Error("Missing email recipient `to`");
 
-  return transporter.sendMail({
-    from: from || process.env.SMTP_FROM || process.env.SMTP_USER,
-    to,
-    subject: subject || "",
-    text,
-    html,
-    attachments,
-  });
+  try {
+    const info = await transporter.sendMail({
+      from: from || process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject,
+      text,
+      html,
+      attachments,
+    });
+
+    console.log("Email sent successfully:", info.messageId);
+    console.log("Accepted:", info.accepted);
+    console.log("Rejected:", info.rejected);
+    console.log("Envelope:", info.envelope);
+    return info;
+  } catch (error) {
+    console.error("Error sending email:", error);
+    throw error;
+  }
+
+};
+
+/**
+ * Build the "file received" HTML email from the template.
+ * @param {{ senderEmail: string, shareLink: string, fileCount?: number, totalSize?: string, expireDate?: string, clientUrl?: string }} data
+ * @returns {string} populated HTML string
+ */
+export const buildFileReceivedHtml = (data) => {
+  const templatePath = path.join(__dirname, "emailTemplates", "fileReceived.html");
+  let html = fs.readFileSync(templatePath, "utf-8");
+
+  const totalBytes = typeof data.totalSize === "number" ? data.totalSize : 0;
+  const formattedSize =
+    totalBytes > 0
+      ? totalBytes >= 1_073_741_824
+        ? `${(totalBytes / 1_073_741_824).toFixed(1)} GB`
+        : totalBytes >= 1_048_576
+          ? `${(totalBytes / 1_048_576).toFixed(1)} MB`
+          : `${(totalBytes / 1024).toFixed(1)} KB`
+      : "N/A";
+
+  const expireDate = data.expireDate
+    ? new Date(data.expireDate).toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    })
+    : "N/A";
+
+  const replacements = {
+    "{{SENDER_EMAIL}}": data.senderEmail || "Unknown",
+    "{{SENDER_INITIAL}}": (data.senderEmail || "?")[0].toUpperCase(),
+    "{{SHARE_LINK}}": data.shareLink || "#",
+    "{{FILE_COUNT}}": String(data.fileCount ?? 1),
+    "{{TOTAL_SIZE}}": formattedSize,
+    "{{EXPIRE_DATE}}": expireDate,
+    "{{CLIENT_URL}}": data.clientUrl || process.env.CLIENT_URL || "#",
+  };
+
+  for (const [token, value] of Object.entries(replacements)) {
+    html = html.replaceAll(token, value);
+  }
+
+  return html;
 };
 
 export { transporter };

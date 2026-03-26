@@ -36,6 +36,10 @@ const fileSchema = new mongoose.Schema({
         type: Number,
         default: 0,
     },
+    message: {
+        type: String,
+        default: "",
+    },
     expireIn: {
         type: String,
         enum: ["1d",
@@ -66,7 +70,8 @@ const fileSchema = new mongoose.Schema({
             "7 Years",
             "8 Years",
             "9 Years",
-            "10 Years"],
+            "10 Years"
+        ],
         default: "7d",
     },
     background: {
@@ -90,7 +95,12 @@ const fileSchema = new mongoose.Schema({
         type: String,
         required: false,
     },
-})
+    status: {
+        type: String,
+        enum: ["active", "destroyed"],
+        default: "active"
+    }
+}, { timestamps: true })
 
 const File = mongoose.model("File", fileSchema);
 export default File;
