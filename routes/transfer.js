@@ -5,6 +5,7 @@ import {
     getTransfer, 
     initiateMultipartUpload,
     getPartUploadUrl,
+    getPartUploadUrls,
     completeMultipartUpload,
     abortMultipartUpload,
     verifyPassword,
@@ -23,6 +24,7 @@ router.post("/generate-upload-urls", generateUploadUrls);
  // Multipart Upload Routes
 router.post("/initiate-multipart", initiateMultipartUpload);
 router.post("/get-part-url", getPartUploadUrl);
+router.post("/get-part-urls", getPartUploadUrls);
 router.post("/complete-multipart", completeMultipartUpload);
 router.post("/abort-multipart", abortMultipartUpload);
 

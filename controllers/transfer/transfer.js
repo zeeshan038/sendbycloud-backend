@@ -451,6 +451,45 @@ export const getPartUploadUrl = async (req, res) => {
 };
 
 /**
+ * @Description Generate multiple presigned URLs for specific parts (Batch)
+ * @Route POST api/transfer/get-part-urls
+ * @Access Public
+ */
+export const getPartUploadUrls = async (req, res) => {
+    const { uploadId, key, partNumbers } = req.body;
+    try {
+        if (!uploadId || !key || !partNumbers || !Array.isArray(partNumbers)) {
+            return res.status(400).json({
+                status: false,
+                error: "uploadId, key, and partNumbers array are required"
+            });
+        }
+
+        const urls = {};
+        // Parallelize signing — getSignedUrl is fast but async
+        await Promise.all(
+            partNumbers.map(async (pn) => {
+                const command = new UploadPartCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: key,
+                    UploadId: uploadId,
+                    PartNumber: Number(pn),
+                });
+                urls[pn] = await getSignedUrl(r2Client, command, { expiresIn: 3600 });
+            })
+        );
+
+        return res.status(200).json({
+            status: true,
+            urls
+        });
+    } catch (error) {
+        console.error("Error generating part URLs (batch):", error);
+        return res.status(500).json({ status: false, msg: error.message });
+    }
+};
+
+/**
  * @Description Complete a multipart upload
  * @Route POST api/transfer/complete-multipart
  * @Access Public
