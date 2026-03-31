@@ -7,16 +7,16 @@ const fileSchema = new mongoose.Schema({
         ref: "User"
     },
     senderEmail: {
-        type: String,
+        type: String
     },
     recevierEmails: {
-        type: [String],
+        type: [String]
     },
     files: {
         type: [mongoose.Schema.Types.Mixed]
     },
     totalSize: {
-        type: Number,
+        type: Number
     },
     uploadType: {
         type: String,
@@ -75,6 +75,12 @@ const fileSchema = new mongoose.Schema({
         default: "7d",
     },
     background: {
+        type: String,
+    },
+    backgroundType: {
+        type: String,
+    },
+    backgroundLink: {
         type: String,
     },
     selfDestruct: {

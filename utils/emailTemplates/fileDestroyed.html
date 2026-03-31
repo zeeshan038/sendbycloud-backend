@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Your transfer has been destroyed</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: "Inter", Arial, sans-serif;
+        background-color: #0f0f13;
+        color: #e2e8f0;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .email-wrapper {
+        background-color: #0f0f13;
+        padding: 48px 16px;
+        min-height: 100vh;
+      }
+
+      .email-container {
+        max-width: 580px;
+        margin: 0 auto;
+        background: linear-gradient(145deg, #1a1a2e 0%, #16213e 100%);
+        border-radius: 20px;
+        overflow: hidden;
+        border: 1px solid rgba(239, 68, 68, 0.2);
+        box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5),
+          0 0 0 1px rgba(239, 68, 68, 0.05);
+      }
+
+      /* ── Header ── */
+      .header {
+        background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%);
+        padding: 40px 40px 36px;
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .logo {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 24px;
+        position: relative;
+        z-index: 1;
+      }
+
+      .logo-text {
+        font-size: 20px;
+        font-weight: 700;
+        color: #ffffff;
+        letter-spacing: -0.3px;
+      }
+
+      .header-icon {
+        width: 72px;
+        height: 72px;
+        background: rgba(255, 255, 255, 0.15);
+        border-radius: 50%;
+        margin: 0 auto 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 34px;
+        position: relative;
+        z-index: 1;
+        backdrop-filter: blur(8px);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      .header h1 {
+        font-size: 26px;
+        font-weight: 700;
+        color: #ffffff;
+        margin-bottom: 8px;
+        position: relative;
+        z-index: 1;
+        letter-spacing: -0.5px;
+      }
+
+      /* ── Body ── */
+      .body {
+        padding: 40px;
+      }
+
+      .greeting {
+        font-size: 16px;
+        color: #94a3b8;
+        margin-bottom: 24px;
+        line-height: 1.6;
+      }
+
+      /* File info */
+      .file-details {
+        background: rgba(239, 68, 68, 0.05);
+        border: 1px solid rgba(239, 68, 68, 0.2);
+        border-radius: 14px;
+        padding: 20px 24px;
+        margin-bottom: 24px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .file-icon {
+        width: 44px;
+        height: 44px;
+        background: rgba(239, 68, 68, 0.1);
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        border: 1px solid rgba(239, 68, 68, 0.2);
+      }
+
+      .file-name {
+        font-size: 14px;
+        font-weight: 600;
+        color: #fca5a5;
+      }
+
+      /* Security note */
+      .security-note {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 32px;
+        font-size: 13px;
+        color: #94a3b8;
+        line-height: 1.5;
+      }
+
+      /* Footer */
+      .footer {
+        background: rgba(0, 0, 0, 0.25);
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        padding: 28px 40px;
+        text-align: center;
+      }
+
+      .footer-logo {
+        font-size: 16px;
+        font-weight: 700;
+        color: #dc2626;
+        margin-bottom: 10px;
+      }
+
+      .footer-text {
+        font-size: 12px;
+        color: #475569;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="email-wrapper">
+      <div class="email-container">
+        <!-- Header -->
+        <div class="header">
+          <div class="logo">
+            <span class="logo-text">SendByCloud</span>
+          </div>
+          <div class="header-icon">🗑️</div>
+          <h1>Transfer Destroyed</h1>
+        </div>
+
+        <!-- Body -->
+        <div class="body">
+          <p class="greeting">
+            Hello, <br><br>
+            Your transfer with ID <strong>{{SHORT_ID}}</strong> has reached its expiration date and has been <strong>permanently destroyed</strong> from our secure servers.
+          </p>
+
+          <div class="file-details">
+            <div class="file-icon">📁</div>
+            <div class="file-name">{{FILE_COUNT}} file(s) removed</div>
+          </div>
+
+          <div class="security-note">
+            In accordance with our security policy, all files and metadata associated with this transfer have been wiped from our storage and cannot be recovered.
+          </div>
+
+          <p class="greeting">
+            Thank you for using <strong>SendByCloud</strong> for your secure transfers.
+          </p>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+          <div class="footer-logo">SendByCloud</div>
+          <p class="footer-text">
+            © 2025 SendByCloud. All rights reserved.<br />
+            This is an automated notification about your transfer status.
+          </p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

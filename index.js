@@ -28,7 +28,8 @@ app.use((req, res, next) => {
 const allowedOrigins = [
   "http://localhost:5173",
   "https://sendbycloud.com",
-  "https://app.sendbycloud.com"
+  "https://app.sendbycloud.com",
+  "https://sbc-testing.vercel.app"
 ].filter(Boolean);
 
 app.use(cors(

@@ -126,14 +126,24 @@ export const transcodeMultipleResolutions = (source, targets, outputDir) => {
 
             const outputFiles = [];
             targets.forEach((targetRes, i) => {
-                const outPath = path.join(outputDir, `${targetRes.label}_output.mp4`);
-                outputFiles.push({ label: targetRes.label, path: outPath, shortSide: targetRes.shortSide });
+                const outDir = path.join(outputDir, targetRes.label);
+                fs.mkdirSync(outDir, { recursive: true });
+                const m3u8Path = path.join(outDir, `playlist.m3u8`);
+                const tsPattern = path.join(outDir, `segment_%03d.ts`);
+
+                outputFiles.push({ label: targetRes.label, dir: outDir, path: m3u8Path, shortSide: targetRes.shortSide });
                 
                 command
-                    .output(outPath)
+                    .output(m3u8Path)
                     .map(`[outv${i}]`)
                     .videoCodec('libx264')
-                    .videoBitrate(targetRes.bitrate);
+                    .videoBitrate(targetRes.bitrate)
+                    .outputOptions([
+                        '-f hls',
+                        '-hls_time 6',
+                        '-hls_playlist_type vod',
+                        `-hls_segment_filename ${tsPattern}`
+                    ]);
                 
                 if (hasAudio) {
                     command.map(`[a${i}]`);

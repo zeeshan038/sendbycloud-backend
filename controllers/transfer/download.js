@@ -7,6 +7,7 @@ import r2Client from "../../utils/R2.js";
 
 // Models
 import File from "../../models/files.js";
+import { destroyTransfer } from "../../utils/methods.js";
 
 const SIGNED_URL_EXPIRY = 3600;
 
@@ -111,13 +112,22 @@ export const getDownloadUrl = async (req, res) => {
         }
 
         let qualityUrls = [];
+        let hlsMasterKey = null;
+
         if (
           typeof fileData === "object" &&
           Array.isArray(fileData?.qualities) &&
           fileData.qualities.length > 0
         ) {
-          qualityUrls = await Promise.all(
+          const processedQualities = await Promise.all(
             fileData.qualities.map(async (q) => {
+              if (q.key && q.key.endsWith('.m3u8')) {
+                if (q.label === 'HLS_Master') {
+                  hlsMasterKey = q.key;
+                }
+                return null;
+              }
+
               try {
                 await ensureObjectExists(q.key);
 
@@ -150,6 +160,14 @@ export const getDownloadUrl = async (req, res) => {
               }
             })
           );
+          qualityUrls = processedQualities.filter(Boolean);
+        }
+
+        let streamUrlResult = null;
+        if (/\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName)) {
+          streamUrlResult = hlsMasterKey
+            ? `${process.env.BACKEND_URL || "http://localhost:8080"}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(hlsMasterKey)}`
+            : `${process.env.BACKEND_URL || "http://localhost:8080"}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`;
         }
 
         return {
@@ -167,9 +185,7 @@ export const getDownloadUrl = async (req, res) => {
             typeof fileData === "object" ? fileData?.resolution || null : null,
           duration:
             typeof fileData === "object" ? fileData?.duration || null : null,
-          streamUrl: /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName)
-            ? `${process.env.BACKEND_URL || "http://localhost:8080"}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`
-            : null,
+          streamUrl: streamUrlResult,
           missing
         };
       })
@@ -217,7 +233,10 @@ export const getDownloadUrl = async (req, res) => {
         senderEmail: transfer.senderEmail,
         recevierEmails: transfer.recevierEmails,
         totalSize: transfer.totalSize,
-        expireIn: transfer.expireIn
+        expireIn: transfer.expireIn,
+        background: transfer.background,
+        backgroundType: transfer.backgroundType,
+        backgroundLink: transfer.backgroundLink
       }
     });
   } catch (error) {
@@ -319,6 +338,13 @@ export const completeDownload = async (req, res) => {
     console.log(
       `Download completed for transfer: ${shortId}. New count: ${updated.downloadCount}`
     );
+
+    // If self-destruct is enabled, destroy the transfer immediately after the first successful download
+    if (updated.selfDestruct && updated.downloadCount >= 1) {
+      console.log(`[SELF-DESTRUCT] Triggering destruction for ${shortId}`);
+      // We don't await this to avoid blocking the response, but it runs in background
+      destroyTransfer(updated).catch(err => console.error(`[SELF-DESTRUCT] Error:`, err.message));
+    }
 
     return res.status(200).json({
       status: true,
@@ -453,21 +479,34 @@ export const getDownloadPartUrl = async (req, res) => {
 
 
 
-    // ✅ Fix
-    const partIndex = Number(partNumber) - 1; 
+    const partIndex = Number(partNumber) - 1;
     const start = partIndex * Number(partSize);
     const end = start + Number(partSize) - 1;
 
-    // IMPORTANT:
-    // Do NOT sign the URL with Range.
-    // The frontend should send Range itself when using this URL.
+    // Check if Download Proxy (Cloudflare Worker) is configured
+    if (process.env.DOWNLOAD_PROXY_URL) {
+      const proxyUrl = new URL(process.env.DOWNLOAD_PROXY_URL);
+      proxyUrl.searchParams.set("key", effectiveKey);
+      proxyUrl.searchParams.set("start", start);
+      proxyUrl.searchParams.set("end", end);
+
+      return res.status(200).json({
+        status: true,
+        url: proxyUrl.toString(),
+        range: { start, end },
+        isProxy: true
+      });
+    }
+
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
-      Key: effectiveKey
+      Key: effectiveKey,
+      Range: `bytes=${start}-${end}`
     });
 
     const url = await getSignedUrl(r2Client, command, {
-      expiresIn: SIGNED_URL_EXPIRY
+      expiresIn: SIGNED_URL_EXPIRY,
+      unhoistableHeaders: new Set(['x-amz-checksum-mode'])
     });
 
     return res.status(200).json({
@@ -475,6 +514,7 @@ export const getDownloadPartUrl = async (req, res) => {
       url,
       range: { start, end }
     });
+
   } catch (error) {
     console.error("Error generating part download URL:", error);
 

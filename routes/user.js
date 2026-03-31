@@ -1,5 +1,13 @@
 import express from "express";
-import { Register, Login, SignupWithFirebase } from "../controllers/user.js";
+
+import {
+    Register,
+    Login,
+    SignupWithFirebase,
+    getUserStorage,
+    changePassword
+} from "../controllers/user.js";
+import { verifyUser } from "../middlewares/verifyUser.js";
 
 const router = express.Router();
 
@@ -10,4 +18,8 @@ router.post("/login", Login);
 router.post("/signupwithgoogle", SignupWithFirebase);
 router.post("/signupwithmicrosoft", SignupWithFirebase);
 
-export default router;
+router.use(verifyUser);
+router.get("/storage", getUserStorage);
+router.post("/change-password", changePassword);
+
+export default router; 

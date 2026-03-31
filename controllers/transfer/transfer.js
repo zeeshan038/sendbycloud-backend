@@ -1,15 +1,27 @@
 //NPM Pacakages
 import mongoose from "mongoose";
 import { nanoid } from "nanoid";
+import jwt from "jsonwebtoken";
 
 //Models
 import File from "../../models/files.js";
+import Background from "../../models/Backgrounds.js";
+import OTP from "../../models/OTP.js";
+import User from "../../models/User.js";
+
 
 //schema
-import { TransferSchema, VerifyPasswordSchema } from "../../schema/Transfer.js";
+import {
+    TransferSchema,
+    VerifyPasswordSchema
+} from "../../schema/Transfer.js";
 
 // utils
-import { createZipAndUpload, extractVideoResolutions, calculateExpireDate } from "../../utils/methods.js";
+import {
+    createZipAndUpload,
+    extractVideoResolutions,
+    calculateExpireDate
+} from "../../utils/methods.js";
 import r2Client from "../../utils/R2.js";
 import {
     PutObjectCommand,
@@ -44,9 +56,9 @@ export const speedTest = async (req, res) => {
                 const parsedSize = Number(size);
                 const downloadSize = Number.isFinite(parsedSize) && parsedSize > 0
                     ? parsedSize
-                    : 5 * 1024 * 1024; // default 5MB
+                    : 5 * 1024 * 1024;
 
-                const maxSize = 100 * 1024 * 1024; // 100MB
+                const maxSize = 100 * 1024 * 1024;
                 if (downloadSize > maxSize) {
                     return res.status(400).json({
                         status: false,
@@ -147,6 +159,7 @@ export const speedTest = async (req, res) => {
  */
 export const sendFile = async (req, res) => {
     const userId = req.user?._id ?? null;
+
     const {
         getShareableLink = false,
         selfDestruct = false,
@@ -154,7 +167,6 @@ export const sendFile = async (req, res) => {
     } = req.query;
     const payload = req.body;
 
-    // Validation
     const { error } = TransferSchema(payload);
     if (error) {
         return res.status(400).json({
@@ -174,11 +186,62 @@ export const sendFile = async (req, res) => {
         downloadLimit,
         expireIn,
         background,
+        backgroundType,
+        backgroundLink,
+        verificationToken,
         transferId: payloadTransferId,
         shortId: payloadShortId
     } = payload;
 
     try {
+        if (!userId && (recevierEmails && recevierEmails.length > 0)) {
+            let isVerified = false;
+
+            if (verificationToken) {
+                try {
+                    const decoded = jwt.verify(verificationToken, process.env.JWT_SECRET);
+                    if (decoded.email === senderEmail && decoded.type === 'transfer_verification') {
+                        isVerified = true;
+                    }
+                } catch (err) {
+                    console.error("Token verification failed:", err.message);
+                }
+            }
+
+            if (!isVerified) {
+                const verifiedOtp = await OTP.findOne({ email: senderEmail, isVerified: true });
+                if (verifiedOtp) {
+                    isVerified = true;
+                    await OTP.deleteOne({ _id: verifiedOtp._id });
+                }
+            }
+
+            if (!isVerified) {
+                return res.status(401).json({
+                    status: false,
+                    msg: "Email verification required for unlogged transfers"
+                });
+            }
+        }
+
+        let activeBackground = background;
+        let activeBackgroundType = backgroundType;
+        let activeBackgroundLink = backgroundLink;
+        console.log("activeBackground", activeBackground);
+        console.log("activeBackgroundType", activeBackgroundType);
+        console.log("activeBackgroundLink", activeBackgroundLink);
+
+        if (!activeBackground) {
+            const query = userId ? { user: userId, isActive: true } : { isActive: true };
+            const latestBg = await Background.findOne(query).sort({ createdAt: -1 });
+
+            if (latestBg) {
+                activeBackground = latestBg.url;
+                activeBackgroundType = latestBg.type;
+                activeBackgroundLink = latestBg.link;
+            }
+        }
+
         const finalExpireDate = expireDate || calculateExpireDate(expireIn);
 
         const file = await File.create({
@@ -192,21 +255,24 @@ export const sendFile = async (req, res) => {
             expireDate: finalExpireDate,
             downloadLimit,
             expireIn,
-            background,
+            background: activeBackground,
+            backgroundType: activeBackgroundType,
+            backgroundLink: activeBackgroundLink,
             selfDestruct: selfDestruct === 'true' || selfDestruct === true,
             isDownloadAble: isDownloadAble === 'true' || isDownloadAble === true,
             shortId: payloadShortId || payloadTransferId || nanoid(8)
         });
 
+        if (userId) {
+            await User.findByIdAndUpdate(userId, { $inc: { storageUsed: totalSize } });
+        }
+
         const shareLink = `${process.env.CLIENT_URL}/${file.shortId}`;
 
-
-        // If multiple files, create zip in background
         if (files.length > 1) {
             createZipAndUpload(file._id, files, file.shortId);
         }
 
-        // Extract video resolutions in background
         const hasVideos = files.some(f => {
             const name = typeof f === 'string' ? f : (f.fileName || f.name || f.key);
             return /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(name);
@@ -268,7 +334,10 @@ export const sendFile = async (req, res) => {
  * @Access Public
  */
 export const generateUploadUrls = async (req, res) => {
-    const { files, transferId: existingId } = req.body;
+    const {
+        files,
+        transferId: existingId
+    } = req.body;
     try {
         if (!files || !Array.isArray(files) || files.length === 0) {
             return res.status(400).json({ status: false, error: "Please provide an array of files" });
@@ -475,10 +544,16 @@ export const getTransfer = async (req, res) => {
             });
         }
 
+        // Remove sensitive fields from preview
+        const transferObj = transfer.toObject();
+        const isProtected = !!transferObj.password;
+        delete transferObj.password;
+
         return res.status(200).json({
             status: true,
             msg: "Transfer found",
-            transferDetails: transfer
+            isProtected,
+            transferDetails: transferObj
         });
     } catch (error) {
         console.error("Error fetching transfer:", error);
@@ -619,7 +694,14 @@ export const streamVideo = async (req, res) => {
             if (mainKey === key) return true;
             // Also check transcoded qualities
             if (f.qualities && Array.isArray(f.qualities)) {
-                return f.qualities.some(q => q.key === key);
+                return f.qualities.some(q => {
+                    if (q.key === key) return true;
+                    if (q.key.endsWith('.m3u8') && key.endsWith('.ts')) {
+                        const dirPrefix = q.key.substring(0, q.key.lastIndexOf('/') + 1);
+                        if (key.startsWith(dirPrefix)) return true;
+                    }
+                    return false;
+                });
             }
             return false;
         });
@@ -653,17 +735,31 @@ export const streamVideo = async (req, res) => {
 
             const response = await r2Client.send(fileCommand);
 
+            // Add caching for HLS segments
+            if (key.endsWith('.ts')) {
+                res.setHeader('Cache-Control', 'public, max-age=31536000');
+            } else if (key.endsWith('.m3u8')) {
+                res.setHeader('Cache-Control', 'no-cache');
+            }
+
             res.writeHead(206, {
                 'Content-Range': `bytes ${start}-${end}/${fileSize}`,
                 'Accept-Ranges': 'bytes',
                 'Content-Length': chunksize,
-                'Content-Type': metadata.ContentType || 'video/mp4',
+                'Content-Type': metadata.ContentType || 'video/MP2T',
             });
             response.Body.pipe(res);
         } else {
+            // Add caching for HLS segments
+            if (key.endsWith('.ts')) {
+                res.setHeader('Cache-Control', 'public, max-age=31536000');
+            } else if (key.endsWith('.m3u8')) {
+                res.setHeader('Cache-Control', 'no-cache');
+            }
+
             res.writeHead(200, {
                 'Content-Length': fileSize,
-                'Content-Type': metadata.ContentType || 'video/mp4',
+                'Content-Type': metadata.ContentType || 'video/MP2T',
             });
 
             const fileCommand = new GetObjectCommand({

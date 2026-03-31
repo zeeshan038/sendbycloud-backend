@@ -24,8 +24,11 @@ export const TransferSchema = (payload) => {
             "1 Year", "2 Years", "3 Years", "4 Years", "5 Years", "6 Years", "7 Years", "8 Years", "9 Years", "10 Years"
         ).default("7d"),
         background: Joi.string().allow("", null),
+        backgroundType: Joi.string().allow("", null),
+        backgroundLink: Joi.string().uri().allow("", null),
         selfDestruct: Joi.boolean().default(false),
-        user: Joi.string().allow(null)
+        user: Joi.string().allow(null),
+        verificationToken: Joi.string().allow("", null).optional()
     }).unknown(true);
 
     return schema.validate(payload);

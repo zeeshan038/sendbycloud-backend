@@ -9,13 +9,15 @@ import os from "os";
 import { nanoid } from "nanoid";
 import { getVideoMetadata, RESOLUTIONS,transcodeMultipleResolutions } from "./videoProcessor.js";
 
-import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import r2Client from "./R2.js";
 import File from "../models/files.js";
+import User from "../models/User.js";
+import { sendEmail, buildFileDestroyedHtml } from "./Nodemailer.js";
 
 export const generateToken = (user) => {
-    return jwt.sign({ user }, process.env.JWT_SECRET, { expiresIn: "1h" });
+    return jwt.sign({ user }, process.env.JWT_SECRET);
 };
 
 export const sanitizeFileName = (fileName) => {
@@ -106,6 +108,12 @@ export const extractVideoResolutions = async (transferId, files) => {
         for (let i = 0; i < updatedFiles.length; i++) {
             const fileData = updatedFiles[i];
             const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
+            
+            // Critical check for literal 'TRANSFER_ID' string which suggests a frontend/upload bug
+            if (objectKey.includes("TRANSFER_ID")) {
+                console.error(`[VIDEO] CRITICAL: Literal "TRANSFER_ID" found in key "${objectKey}". This transfer is corrupted and cannot be processed. Please check your frontend logic.`);
+                continue;
+            }
 
             // Check if it's a video by extension
             const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(objectKey);
@@ -155,31 +163,87 @@ export const extractVideoResolutions = async (transferId, files) => {
                             console.log(`Starting multi-resolution transcoding for ${objectKey} in ${tempDir}`);
                             const outputFiles = await transcodeMultipleResolutions(tempVideoPath, targets, tempDir);
 
+                            const pathParts = objectKey.split('/');
+                            const fileName = pathParts.pop();
+                            const folderPath = pathParts.join('/');
+                            
+                            let masterPlaylistContent = '#EXTM3U\n';
+                            const qualityEntries = [];
+
                             await Promise.all(outputFiles.map(async (outFile) => {
-                                const pathParts = objectKey.split('/');
-                                const fileName = pathParts.pop();
-                                const folderPath = pathParts.join('/');
-                                const resKey = `${folderPath}/${outFile.label}_${fileName}`;
-
-                                const fileStream = fs.createReadStream(outFile.path);
-                                const upload = new Upload({
-                                    client: r2Client,
-                                    params: {
-                                        Bucket: process.env.R2_BUCKET_NAME,
-                                        Key: resKey,
-                                        Body: fileStream,
-                                        ContentType: 'video/mp4'
+                                const qualityPrefix = `${folderPath}/${outFile.label}_${fileName.replace(/\.[^/.]+$/, "")}`; // Use safe safe name format
+                                const filesToUpload = fs.readdirSync(outFile.dir);
+                                
+                                await Promise.all(filesToUpload.map(async (file) => {
+                                    const filePath = path.join(outFile.dir, file);
+                                    const resKey = `${qualityPrefix}/${file}`;
+                                    const contentType = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
+                                    
+                                    let body;
+                                    if (file.endsWith('.m3u8')) {
+                                        const m3u8Content = fs.readFileSync(filePath, 'utf8');
+                                        const backendUrl = process.env.BACKEND_URL || "http://localhost:8080";
+                                        body = m3u8Content.split('\n').map(line => {
+                                            if (line.trim().endsWith('.ts')) {
+                                                return `${backendUrl}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(`${qualityPrefix}/${line.trim()}`)}`;
+                                            }
+                                            return line;
+                                        }).join('\n');
+                                    } else {
+                                        body = fs.createReadStream(filePath);
                                     }
-                                });
 
-                                await upload.done();
-                                console.log(`Uploaded ${outFile.label} to R2`);
+                                    const upload = new Upload({
+                                        client: r2Client,
+                                        params: {
+                                            Bucket: process.env.R2_BUCKET_NAME,
+                                            Key: resKey,
+                                            Body: body,
+                                            ContentType: contentType
+                                        }
+                                    });
+                                    await upload.done();
+                                }));
 
+                                console.log(`Uploaded HLS for ${outFile.label} to R2`);
+
+                                const targetRes = RESOLUTIONS.find(r => r.label === outFile.label);
+                                const bandwidth = targetRes ? parseInt(targetRes.bitrate) * 1000 : 1000000;
+                                const shortSide = outFile.shortSide;
+                                const width = shortSide === 1080 ? 1920 : shortSide === 720 ? 1280 : shortSide === 480 ? 854 : shortSide === 360 ? 640 : shortSide === 240 ? 426 : 256;
+                                
+                                const backendUrl = process.env.BACKEND_URL || "http://localhost:8080";
+                                const variantUrl = `${backendUrl}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(`${qualityPrefix}/playlist.m3u8`)}`;
+
+                                // Relative path from master to quality playlist mapping
+                                masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${shortSide}\n`;
+                                masterPlaylistContent += `${variantUrl}\n`;
+
+                                const qualityPlaylistKey = `${qualityPrefix}/playlist.m3u8`;
+                                qualityEntries.push({ label: outFile.label, key: qualityPlaylistKey, isOriginal: false });
+                            }));
+
+                            const masterKey = `${folderPath}/master_${fileName.replace(/\.[^/.]+$/, "")}.m3u8`;
+                            const masterUpload = new Upload({
+                                client: r2Client,
+                                params: {
+                                    Bucket: process.env.R2_BUCKET_NAME,
+                                    Key: masterKey,
+                                    Body: masterPlaylistContent,
+                                    ContentType: 'application/vnd.apple.mpegurl'
+                                }
+                            });
+                            await masterUpload.done();
+                            console.log(`Uploaded master playlist to R2`);
+                            
+                            qualityEntries.push({ label: 'HLS_Master', key: masterKey, isOriginal: false });
+                            
+                            for (const quality of qualityEntries) {
                                 await File.updateOne(
                                     { _id: transferId },
-                                    { $push: { [`files.${i}.qualities`]: { label: outFile.label, key: resKey, isOriginal: false } } }
+                                    { $push: { [`files.${i}.qualities`]: quality } }
                                 );
-                            }));
+                            }
                         } finally {
                             try {
                                 fs.rmSync(tempDir, { recursive: true, force: true });
@@ -210,6 +274,119 @@ export const extractVideoResolutions = async (transferId, files) => {
     }
 };
 
+/**
+ * @Description Permanently destroys a transfer (R2 files + DB status + Email)
+ * @Param transferIdOrObject: File ID or full File object
+ */
+export const destroyTransfer = async (transferIdOrObject) => {
+    try {
+        let transfer = typeof transferIdOrObject === 'object' ? transferIdOrObject : await File.findById(transferIdOrObject);
+        if (!transfer || transfer.status === 'destroyed') return;
+
+        console.log(`[DESTROY] Starting destruction of transfer: ${transfer._id} (${transfer.shortId})`);
+
+        // 1. Delete all original files and their qualities (including HLS segments)
+        for (const fileItem of transfer.files) {
+            const mainKey = typeof fileItem === 'string' ? fileItem : fileItem.key;
+            if (mainKey) {
+                await deleteFromR2(mainKey);
+            }
+
+            // Delete transcoded qualities if they exist
+            if (fileItem.qualities && Array.isArray(fileItem.qualities)) {
+                for (const quality of fileItem.qualities) {
+                    if (quality.key) {
+                        // If it's a playlist, delete everything in that quality "folder"
+                        if (quality.key.endsWith('playlist.m3u8')) {
+                            const prefix = quality.key.replace('playlist.m3u8', '');
+                            await deletePrefixFromR2(prefix);
+                        } else if (quality.key !== mainKey) {
+                            await deleteFromR2(quality.key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Delete zipKey if it exists
+        if (transfer.zipKey) {
+            await deleteFromR2(transfer.zipKey);
+        }
+
+        // 3. Mark as destroyed in DB
+        transfer.status = "destroyed";
+        await transfer.save();
+
+        // 4. Notify end user (sender)
+        if (transfer.senderEmail) {
+            try {
+                const html = buildFileDestroyedHtml({
+                    shortId: transfer.shortId,
+                    fileCount: transfer.files.length
+                });
+                await sendEmail({
+                    to: transfer.senderEmail,
+                    subject: `Files Permanently Destroyed - ${transfer.shortId}`,
+                    html
+                });
+                console.log(`[DESTROY] Notification sent to ${transfer.senderEmail}`);
+            } catch (emailErr) {
+                console.error(`[DESTROY] Failed to send email to ${transfer.senderEmail}:`, emailErr.message);
+            }
+        }
+
+        console.log(`[DESTROY] Successfully destroyed transfer: ${transfer._id}`);
+        return true;
+    } catch (error) {
+        console.error(`[DESTROY] Error destroying transfer:`, error);
+        return false;
+    }
+};
+
+export const deleteFromR2 = async (key) => {
+    try {
+        const command = new DeleteObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key,
+        });
+        await r2Client.send(command);
+        console.log(`[R2] Deleted object: ${key}`);
+    } catch (err) {
+        console.error(`[R2] Error deleting ${key}:`, err.message);
+    }
+};
+
+export const deletePrefixFromR2 = async (prefix) => {
+    try {
+        if (!prefix || prefix === '/' || prefix === '') return;
+
+        const listCommand = new ListObjectsV2Command({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Prefix: prefix,
+        });
+        const listedObjects = await r2Client.send(listCommand);
+
+        if (!listedObjects.Contents || listedObjects.Contents.length === 0) return;
+
+        const deleteCommand = new DeleteObjectsCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Delete: {
+                Objects: listedObjects.Contents.map(({ Key }) => ({ Key })),
+                Quiet: true
+            },
+        });
+
+        await r2Client.send(deleteCommand);
+        console.log(`[R2] Deleted ${listedObjects.Contents.length} objects with prefix: ${prefix}`);
+
+        if (listedObjects.IsTruncated) {
+            await deletePrefixFromR2(prefix);
+        }
+    } catch (err) {
+        console.error(`[R2] Error deleting prefix ${prefix}:`, err.message);
+    }
+};
+
 export const calculateExpireDate = (expireIn) => {
     if (!expireIn || expireIn === "unlimited") return null;
 
@@ -237,4 +414,33 @@ export const calculateExpireDate = (expireIn) => {
     }
 
     return now;
+};
+
+/**
+ * @Description Links any unclaimed transfers (user: null) with the matching senderEmail to a userId
+ * @Param email: The user's email
+ * @Param userId: The user's new Mongoose ID
+ */
+export const claimTransfersByEmail = async (email, userId) => {
+    try {
+        if (!email || !userId) return;
+
+        const unclaimedTransfers = await File.find({ senderEmail: email, user: null });
+        if (unclaimedTransfers.length === 0) return;
+
+        const totalClaimedSize = unclaimedTransfers.reduce((sum, transfer) => sum + (transfer.totalSize || 0), 0);
+
+        const result = await File.updateMany(
+            { senderEmail: email, user: null },
+            { $set: { user: userId } }
+        );
+        
+        if (result.modifiedCount > 0) {
+            console.log(`[CLAIM] Linked ${result.modifiedCount} anonymous transfers (${totalClaimedSize} bytes) to user ${email} (${userId})`);
+            
+            await User.findByIdAndUpdate(userId, { $inc: { storageUsed: totalClaimedSize } });
+        }
+    } catch (error) {
+        console.error(`[CLAIM] Error linking transfers for ${email}:`, error);
+    }
 };

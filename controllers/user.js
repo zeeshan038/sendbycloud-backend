@@ -1,6 +1,6 @@
 import User from "../models/User.js";
 import { RegisterSchema, LoginSchema } from "../schema/User.js";
-import { generateToken } from "../utils/methods.js";
+import { generateToken, claimTransfersByEmail } from "../utils/methods.js";
 import { auth } from "../config/firebase.js";
 import bcrypt from "bcryptjs";
 
@@ -30,9 +30,13 @@ export const Register = async (req, res) => {
     }
     const salt = await bcrypt.genSalt(10);
     const hashPassword = await bcrypt.hash(payload.password, salt);
-    const user = await User.create({...payload, password: hashPassword});
+    const user = await User.create({ ...payload, password: hashPassword });
     const token = generateToken(user);
-   
+
+    // [CLAIM] Link anonymous transfers to the new account
+    await claimTransfersByEmail(user.email, user._id);
+
+
     return res
       .status(200)
       .json({
@@ -75,9 +79,9 @@ export const Login = async (req, res) => {
     }
 
     if (!user.password) {
-      return res.status(400).json({ 
-        status: false, 
-        msg: "This account was created via social login. Please login with Google or Microsoft." 
+      return res.status(400).json({
+        status: false,
+        msg: "This account was created via social login. Please login with Google or Microsoft."
       });
     }
 
@@ -88,7 +92,10 @@ export const Login = async (req, res) => {
         .json({ status: false, msg: "Invalid password" });
     }
     const token = generateToken(user);
-   
+
+    // [CLAIM] Link anonymous transfers just in case there are any
+    await claimTransfersByEmail(user.email, user._id);
+
     return res
       .status(200)
       .json({
@@ -146,6 +153,10 @@ export const SignupWithFirebase = async (req, res) => {
 
     const token = generateToken(user);
 
+    // [CLAIM] Link anonymous transfers to the new or existing account
+    await claimTransfersByEmail(user.email, user._id);
+
+
     return res.status(200).json({
       status: true,
       msg: "Social login successful",
@@ -160,4 +171,67 @@ export const SignupWithFirebase = async (req, res) => {
     });
   }
 };
+ 
 
+/**
+ * @Description Get user storage details
+ * @Route GET /api/user/storage
+ * @Access Private
+ */
+export const getUserStorage = async (req, res) => {
+  const { id } = req.user;
+  try {
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({ status: false, msg: "User not found" });
+    }
+    return res.status(200).json({
+      status: true,
+      msg: "User storage details fetched successfully",
+      storage: user.storageUsed,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      status: false,
+      msg: error.message,
+    });
+  }
+};
+
+
+/**
+ * @Description Change Password
+ * @Route GET /api/user/change-password
+ * @Access Private
+ */
+export const changePassword = async (req, res) => {
+  const { id } = req.user;
+  const { currentPassword, newPassword, confirmPassword } = req.body;
+
+  try {
+    const user = await User.findById(id).select("+password");
+    if (!user) {
+      return res.status(404).json({ status: false, msg: "User not found" });
+    }
+    const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({ status: false, msg: "Current Password is not valid" });
+    }
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ status: false, msg: "New Password and Confirm Password do not match" });
+    }
+    const salt = await bcrypt.genSalt(10);
+    const hashPassword = await bcrypt.hash(newPassword, salt);
+    user.password = hashPassword;
+    await user.save();
+    return res.status(200).json({
+      status: true,
+      msg: "Password changed successfully",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      status: false,
+      msg: error.message,
+    });
+  }
+}

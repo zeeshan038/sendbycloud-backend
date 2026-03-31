@@ -114,5 +114,26 @@ export const buildFileReceivedHtml = (data) => {
   return html;
 };
 
+/**
+ * Build the "file destroyed" HTML email from the template.
+ * @param {{ shortId: string, fileCount?: number }} data
+ * @returns {string} populated HTML string
+ */
+export const buildFileDestroyedHtml = (data) => {
+  const templatePath = path.join(__dirname, "emailTemplates", "fileDestroyed.html");
+  let html = fs.readFileSync(templatePath, "utf-8");
+
+  const replacements = {
+    "{{SHORT_ID}}": data.shortId || "Unknown",
+    "{{FILE_COUNT}}": String(data.fileCount ?? 1),
+  };
+
+  for (const [token, value] of Object.entries(replacements)) {
+    html = html.replaceAll(token, value);
+  }
+
+  return html;
+};
+
 export { transporter };
 export default transporter;
