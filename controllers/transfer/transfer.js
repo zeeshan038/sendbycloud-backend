@@ -387,7 +387,7 @@ export const generateUploadUrls = async (req, res) => {
  * @Access Public
  */
 export const initiateMultipartUpload = async (req, res) => {
-    const { fileName, fileType, transferId: existingId } = req.body;
+    const { fileName, fileType, transferId: existingId, partCount = 0 } = req.body;
     try {
         if (!fileName) {
             return res.status(400).json({ status: false, error: "fileName is required" });
@@ -405,13 +405,33 @@ export const initiateMultipartUpload = async (req, res) => {
         });
 
         const response = await r2Client.send(command);
+        const uploadId = response.UploadId;
+
+        // Optimized Batch Start: Sign the first batch of URLs immediately
+        const initialUrls = {};
+        if (partCount > 0) {
+            const batchSize = Math.min(partCount, 72); // Up to 72 parts in the first response
+            await Promise.all(
+                Array.from({ length: batchSize }, async (_, i) => {
+                    const pn = i + 1;
+                    const partCommand = new UploadPartCommand({
+                        Bucket: process.env.R2_BUCKET_NAME,
+                        Key: objectKey,
+                        UploadId: uploadId,
+                        PartNumber: pn,
+                    });
+                    initialUrls[pn] = await getSignedUrl(r2Client, partCommand, { expiresIn: 3600 });
+                })
+            );
+        }
 
         return res.status(200).json({
             status: true,
             msg: "Multipart upload initiated",
-            uploadId: response.UploadId,
+            uploadId,
             transferId,
-            key: objectKey
+            key: objectKey,
+            initialUrls
         });
     } catch (error) {
         console.error("Error initiating multipart upload:", error);

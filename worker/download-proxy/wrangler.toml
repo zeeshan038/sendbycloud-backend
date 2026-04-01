@@ -1,8 +1,0 @@
-name = "sbc-download-proxy"
-account_id = "bb552a6e1a1a386e53ec4b74c46a9275"
-main = "index.js"
-compatibility_date = "2024-04-01"
-
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "sendbycloud"
