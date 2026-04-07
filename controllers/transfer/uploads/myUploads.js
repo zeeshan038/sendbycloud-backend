@@ -1,4 +1,6 @@
 import File from "../../../models/files.js";
+import User from "../../../models/User.js";
+import { sendEmail, buildFileDestroyedHtml } from "../../../utils/Nodemailer.js";
 
 /**
  * @Description Get all uploads 
@@ -97,7 +99,48 @@ export const deleteFile = async (req, res) => {
                 msg: "File not found"
             })
         }
+        // Reduce user storage defensively
+        if (file.totalSize && file.totalSize > 0) {
+            await User.updateOne(
+                { _id: userId },
+                [
+                    {
+                        $set: {
+                            storageUsed: {
+                                $max: [0, { $subtract: ["$storageUsed", file.totalSize] }]
+                            }
+                        }
+                    }
+                ],
+                { updatePipeline: true }
+            );
+        }
+
+        // Capture details for email before deletion
+        const fileShortId = file.shortId;
+        const fileCount = file.files?.length || 0;
+        const userEmail = req.user?.email || file.senderEmail;
+
         await file.deleteOne();
+
+        // Send destruction email
+        if (userEmail) {
+            try {
+                const emailHtml = buildFileDestroyedHtml({
+                    shortId: fileShortId,
+                    fileCount: fileCount
+                });
+                await sendEmail({
+                    to: userEmail,
+                    subject: `File(s) destroyed - ${fileShortId}`,
+                    html: emailHtml
+                });
+            } catch (emailError) {
+                console.error("Failed to send destruction email:", emailError);
+                // We don't fail the deletion if the email fails
+            }
+        }
+
         res.status(200).json({
             status: true,
             msg: "File deleted successfully"

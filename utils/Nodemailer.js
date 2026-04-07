@@ -135,5 +135,26 @@ export const buildFileDestroyedHtml = (data) => {
   return html;
 };
 
+/**
+ * Build the "welcome" HTML email from the template.
+ * @param {{ userName: string, clientUrl?: string }} data
+ * @returns {string} populated HTML string
+ */
+export const buildWelcomeEmailHtml = (data) => {
+  const templatePath = path.join(__dirname, "emailTemplates", "wellcomeEmail.html");
+  let html = fs.readFileSync(templatePath, "utf-8");
+
+  const replacements = {
+    "{{USER_NAME}}": data.userName || "Subscriber",
+    "{{CLIENT_URL}}": data.clientUrl || process.env.CLIENT_URL || "#",
+  };
+
+  for (const [token, value] of Object.entries(replacements)) {
+    html = html.replaceAll(token, value);
+  }
+
+  return html;
+};
+
 export { transporter };
 export default transporter;

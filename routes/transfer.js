@@ -7,15 +7,19 @@ import {
     getPartUploadUrl,
     getPartUploadUrls,
     completeMultipartUpload,
+    getAllPartUploadUrls,
     abortMultipartUpload,
     verifyPassword,
     deleteTransfer,
     streamVideo,
-    speedTest
+    speedTest,
+    zipCompleteWebhook
 } from "../controllers/transfer/transfer.js";
 import { optionalVerifyUser } from "../middlewares/verifyUser.js";
 
 const router = express.Router();
+
+router.post("/zip-complete", zipCompleteWebhook);
 
 router.use(optionalVerifyUser);
 router.post("/send", sendFile);
@@ -27,6 +31,7 @@ router.post("/get-part-url", getPartUploadUrl);
 router.post("/get-part-urls", getPartUploadUrls);
 router.post("/complete-multipart", completeMultipartUpload);
 router.post("/abort-multipart", abortMultipartUpload);
+router.post("/get-all-part-urls", getAllPartUploadUrls);
 
 // Password & Deletion
 router.post("/verify-password/:shortId", verifyPassword);

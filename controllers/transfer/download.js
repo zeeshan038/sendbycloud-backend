@@ -7,8 +7,9 @@ import r2Client from "../../utils/R2.js";
 import File from "../../models/files.js";
 import { destroyTransfer } from "../../utils/methods.js";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// Constants
 const SIGNED_URL_EXPIRY = 7200;
+const MAX_DOWNLOAD_RANGE_PARTS = 10000;
 
 const _transferCache = new Map();
 
@@ -49,7 +50,11 @@ const runLimitedParallel = async (items, limit, worker) => {
   return results;
 };
 
-// ─── GET /api/transfer/download/:shortId ─────────────────────────────────────
+/**
+ * @Description Get Download URL
+ * @route GET /api/transfer/download/:shortId
+ * @Access Public
+ */
 export const getDownloadUrl = async (req, res) => {
   const { shortId } = req.params;
   const { preview = false, password = "" } = req.query;
@@ -93,16 +98,15 @@ export const getDownloadUrl = async (req, res) => {
       let url = null;
       let missing = false;
 
-      // ── Always generate presigned R2 URL directly — no proxy ──────────────
-      // DOWNLOAD_PROXY_URL is no longer used. Presigned URLs support Range
-      // headers natively, so the frontend fetches R2 directly with no backend
-      // calls during the actual download.
+      // ── Presigned R2 URL — NO Range baked in, so frontend can send any
+      // Range header it needs. This URL is valid for the whole file.
       try {
         const command = new GetObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: objectKey,
           ResponseContentDisposition: buildDownloadDisposition(originalName, preview),
           ResponseCacheControl: "public, max-age=3600"
+          // ← No Range here intentionally. Frontend sends Range as a header.
         });
         url = await getSignedUrl(r2Client, command, { expiresIn: SIGNED_URL_EXPIRY });
       } catch (err) {
@@ -146,7 +150,7 @@ export const getDownloadUrl = async (req, res) => {
       return {
         objectKey,
         url,
-        isDirectUrl: true,  // ← presigned R2 URLs always support Range headers
+        isDirectUrl: true,  // presigned R2 URLs support Range headers natively
         fileName: originalName,
         size: typeof fileData === "object" ? fileData?.size || null : null,
         contentType: typeof fileData === "object" ? fileData?.type || fileData?.fileType || null : null,
@@ -209,7 +213,11 @@ export const getDownloadUrl = async (req, res) => {
   }
 };
 
-// ─── POST /api/transfer/download-start/:shortId ───────────────────────────────
+/**
+ * @Description Start Download
+ * @Route POST /api/transfer/download-start/:shortId
+ * @Access Public
+ */
 export const startDownload = async (req, res) => {
   const { shortId } = req.params;
   const { downloadSessionId } = req.body;
@@ -229,7 +237,11 @@ export const startDownload = async (req, res) => {
   }
 };
 
-// ─── POST /api/transfer/download-complete/:shortId ────────────────────────────
+/**
+ * @Description Complete Download
+ * @Route POST /api/transfer/download-complete/:shortId
+ * @Access Public
+ */
 export const completeDownload = async (req, res) => {
   const { shortId } = req.params;
   const { downloadSessionId } = req.body;
@@ -294,6 +306,12 @@ export const cancelDownload = async (req, res) => {
 };
 
 
+// ─── POST /api/transfer/download-part/:shortId ────────────────────────────────
+// FIX: Range is NO LONGER baked into the presigned URL.
+// The signed URL covers the whole file. The frontend must send
+//   Range: bytes=<start>-<end>
+// as a request header when fetching the returned URL.
+// This prevents R2 signature mismatches that caused silent part hangs.
 export const getDownloadPartUrl = async (req, res) => {
   const { shortId } = req.params;
   const { key, partNumber, partSize, password = "" } = req.body;
@@ -386,16 +404,13 @@ export const getDownloadPartUrl = async (req, res) => {
       ? Math.min(start + partSizeNum - 1, fileSize - 1)
       : start + partSizeNum - 1;
 
-    // ── Always return a presigned URL — no proxy ───────────────────────────
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
       Key: effectiveKey,
-      Range: `bytes=${start}-${end}`,
       ResponseCacheControl: "public, max-age=3600"
     });
 
     const url = await getSignedUrl(r2Client, command, { expiresIn: SIGNED_URL_EXPIRY });
-
     return res.status(200).json({ status: true, url, range: { start, end } });
 
   } catch (error) {
@@ -409,6 +424,77 @@ export const getDownloadPartUrl = async (req, res) => {
       return res.status(404).json({ status: false, msg: "File not found in storage" });
     }
 
+    return res.status(500).json({ status: false, msg: error.message });
+  }
+};
+
+
+
+// ─── POST /api/transfer/get-all-download-part-urls/:shortId ──────────────────
+export const getAllDownloadPartUrls = async (req, res) => {
+  const { shortId } = req.params;
+  const { key, partSize, totalSize, password = "" } = req.body;
+
+  try {
+    if (!key || !partSize || !totalSize)
+      return res.status(400).json({
+        status: false,
+        msg: "key, partSize, and totalSize are required"
+      });
+
+    const transfer = await getCachedTransfer(shortId);
+    if (!transfer)
+      return res.status(404).json({ status: false, msg: "Transfer not found" });
+
+    if (transfer.password && transfer.password !== password)
+      return res.status(401).json({ status: false, msg: "Invalid password" });
+
+    const effectiveKey = key === "zip" ? transfer.zipKey : key;
+    if (!effectiveKey)
+      return res.status(400).json({ status: false, msg: "Valid key required" });
+
+    const isValidFile =
+      transfer.zipKey === effectiveKey ||
+      transfer.files.some((f) => {
+        const mainKey = typeof f === "string" ? f : f.key;
+        if (mainKey === effectiveKey) return true;
+        if (Array.isArray(f?.qualities))
+          return f.qualities.some((q) => q.key === effectiveKey);
+        return false;
+      });
+
+    if (!isValidFile)
+      return res.status(403).json({ status: false, msg: "Unauthorized" });
+
+    const numParts = Math.ceil(totalSize / partSize);
+
+    if (numParts > MAX_DOWNLOAD_RANGE_PARTS)
+      return res.status(400).json({
+        status: false,
+        msg: `Too many parts (max ${MAX_DOWNLOAD_RANGE_PARTS}); use a larger partSize for this file`
+      });
+
+    // Sign ONE url — R2 presigned URLs support Range headers natively
+    // so we only need a single URL, the frontend sends Range per part
+    const command = new GetObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: effectiveKey,
+      ResponseCacheControl: "public, max-age=3600"
+    });
+
+    const url = await getSignedUrl(r2Client, command, { expiresIn: SIGNED_URL_EXPIRY });
+
+    // Build range map for all parts
+    const parts = Array.from({ length: numParts }, (_, i) => {
+      const start = i * partSize;
+      const end = Math.min(start + partSize - 1, totalSize - 1);
+      return { partNumber: i + 1, url, range: { start, end } };
+    });
+
+    return res.status(200).json({ status: true, parts });
+
+  } catch (error) {
+    console.error("Error generating batch download URLs:", error);
     return res.status(500).json({ status: false, msg: error.message });
   }
 };

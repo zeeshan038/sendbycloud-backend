@@ -35,6 +35,14 @@ const userSchema = new mongoose.Schema({
       type: Number,
       default: 0
    },
+   isTwoFactorEnabled: {
+      type: Boolean,
+      default: false
+   },
+   isEmailVerified: {
+      type: Boolean,
+      default: false
+   }
 });
 
-export default mongoose.model("User", userSchema); 
+export default mongoose.model("User", userSchema);

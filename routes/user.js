@@ -5,7 +5,12 @@ import {
     Login,
     SignupWithFirebase,
     getUserStorage,
-    changePassword
+    changePassword,
+    getSettings,
+    toggle2FA,
+    verifyToggle2FA,
+    checkToggle,
+ 
 } from "../controllers/user.js";
 import { verifyUser } from "../middlewares/verifyUser.js";
 
@@ -21,5 +26,9 @@ router.post("/signupwithmicrosoft", SignupWithFirebase);
 router.use(verifyUser);
 router.get("/storage", getUserStorage);
 router.post("/change-password", changePassword);
+router.get("/settings", getSettings);
+router.post("/toggle-2fa", toggle2FA);
+router.post("/verify-toggle-2fa", verifyToggle2FA);
+router.get("/check-toggle-2fa", checkToggle);
 
 export default router; 

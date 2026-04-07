@@ -1,0 +1,28 @@
+name = "sendbycloud-zipper"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+account_id = "bb552a6e1a1a386e53ec4b74c46a9275"
+
+[[r2_buckets]]
+binding = "MY_BUCKET"
+bucket_name = "sendbycloud"
+
+[vars]
+BACKEND_URL = "https://sbcbackend.sendbycloud.com"
+
+# Secrets (set via wrangler CLI)
+# WORKER_SECRET
+# R2_FOLDER
+
+[[durable_objects.bindings]]
+name = "ZIP_DO"
+class_name = "ZipDurableObject"
+script_name = "sendbycloud-zipper"
+
+[durable_objects]
+location_hint = "enam"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ZipDurableObject"]

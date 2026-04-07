@@ -15,9 +15,7 @@ export const sendOTP = async (req, res) => {
     }
 
     try {
-     
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
         await OTP.findOneAndUpdate(
             { email },
             { otp, createdAt: Date.now() },

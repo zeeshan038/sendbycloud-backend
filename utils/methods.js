@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { nanoid } from "nanoid";
-import { getVideoMetadata, RESOLUTIONS,transcodeMultipleResolutions } from "./videoProcessor.js";
+import { getVideoMetadata, RESOLUTIONS, transcodeVideo } from "./videoProcessor.js";
 
 import { GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -25,13 +25,24 @@ export const sanitizeFileName = (fileName) => {
 };
 
 
-
-
 export const createZipAndUpload = async (transferId, files, shortId) => {
     let upload;
     try {
+        const transfer = await File.findById(transferId);
+        if (!transfer) return;
+
+        const maxZipBytes = process.env.ZIP_MAX_TOTAL_BYTES
+            ? Number(process.env.ZIP_MAX_TOTAL_BYTES)
+            : 0;
+        if (Number.isFinite(maxZipBytes) && maxZipBytes > 0 && transfer.totalSize > maxZipBytes) {
+            console.log(
+                `[ZIP] Skipped ${shortId}: totalSize ${transfer.totalSize} > ZIP_MAX_TOTAL_BYTES ${maxZipBytes}`
+            );
+            return;
+        }
+
         const archive = archiver('zip', {
-            zlib: { level: 9 }
+            zlib: { level: 0 } 
         });
 
         archive.on("error", (err) => {
@@ -51,32 +62,54 @@ export const createZipAndUpload = async (transferId, files, shortId) => {
                 Body: passThrough,
                 ContentType: 'application/zip'
             },
-            queueSize: 10,
-            partSize: 10 * 1024 * 1024
+            queueSize: 20,
+            partSize: 100 * 1024 * 1024
+        });
+
+        let lastLoggedMB = 0;
+        upload.on("httpUploadProgress", (progress) => {
+            const loadedMB = Math.floor(progress.loaded / (1024 * 1024));
+            if (loadedMB - lastLoggedMB >= 500) {
+                console.log(`[ZIP] ${shortId} Progress: ~${loadedMB} MB uploaded`);
+                lastLoggedMB = loadedMB;
+            }
         });
 
         archive.pipe(passThrough);
 
-        const fetchedFiles = await Promise.all(files.map(async (fileData) => {
+        const appendStreamToArchive = (stream, name) =>
+            new Promise((resolve, reject) => {
+                const onEntry = () => {
+                    archive.off("error", onError);
+                    resolve();
+                };
+                const onError = (err) => {
+                    archive.off("entry", onEntry);
+                    reject(err);
+                };
+                archive.once("entry", onEntry);
+                archive.once("error", onError);
+                archive.append(stream, { name });
+            });
+
+        for (const fileData of files) {
             const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
             const originalName = typeof fileData === 'object' && fileData.name
                 ? fileData.name
                 : (objectKey.split('_').slice(1).join('_') || objectKey);
 
-            const response = await r2Client.send(new GetObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: objectKey,
-            }));
-            return { body: response.Body, name: originalName };
-        }));
-
-        for (const { body, name } of fetchedFiles) {
-            const entryName = files.length > 1 ? `Files/${name}` : name;
-            archive.append(body, { name: entryName });
-            console.log(`[ZIP] Appended ${name} to archive`);
+            try {
+                const response = await r2Client.send(new GetObjectCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: objectKey,
+                }));
+                await appendStreamToArchive(response.Body, originalName);
+                console.log(`[ZIP] Appended ${originalName} to archive`);
+            } catch (err) {
+                console.error(`[ZIP] Failed to fetch ${originalName}:`, err.message);
+            }
         }
 
-        // Finalize the archive after all files are appended
         archive.finalize();
 
         // Wait for the upload to complete
@@ -119,27 +152,15 @@ export const extractVideoResolutions = async (transferId, files) => {
             const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(objectKey);
             if (!isVideo) continue;
 
-            let tempVideoPath = null;
             try {
-                tempVideoPath = path.join(os.tmpdir(), `temp-${nanoid()}-${objectKey.split('/').pop()}`);
-                console.log(`[VIDEO] Downloading ${objectKey} to ${tempVideoPath} for processing...`);
+                console.log(`[VIDEO] Getting metadata for ${objectKey} without downloading using presigned URL...`);
 
-                const getCommand = new GetObjectCommand({
+                const presignedUrl = await getSignedUrl(r2Client, new GetObjectCommand({
                     Bucket: process.env.R2_BUCKET_NAME,
                     Key: objectKey,
-                });
+                }), { expiresIn: 3600 });
 
-                const response = await r2Client.send(getCommand);
-                const writeStream = fs.createWriteStream(tempVideoPath);
-
-                await new Promise((resolve, reject) => {
-                    response.Body.pipe(writeStream);
-                    writeStream.on('finish', resolve);
-                    writeStream.on('error', reject);
-                });
-
-                console.log(`[VIDEO] Download complete. Running ffprobe on local file.`);
-                const metadata = await getVideoMetadata(tempVideoPath);
+                const metadata = await getVideoMetadata(presignedUrl);
 
                 if (metadata && metadata.shortSide) {
                     // Update metadata immediately
@@ -158,98 +179,56 @@ export const extractVideoResolutions = async (transferId, files) => {
 
                     const targets = RESOLUTIONS.filter(r => r.shortSide < metadata.shortSide);
                     if (targets.length > 0) {
-                        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcode-'));
-                        try {
-                            console.log(`Starting multi-resolution transcoding for ${objectKey} in ${tempDir}`);
-                            const outputFiles = await transcodeMultipleResolutions(tempVideoPath, targets, tempDir);
+                        console.log(`Starting stream-based multi-resolution transcoding for ${objectKey}`);
 
-                            const pathParts = objectKey.split('/');
-                            const fileName = pathParts.pop();
-                            const folderPath = pathParts.join('/');
-                            
-                            let masterPlaylistContent = '#EXTM3U\n';
-                            const qualityEntries = [];
+                        const pathParts = objectKey.split('/');
+                        const fileName = pathParts.pop();
+                        const folderPath = pathParts.join('/');
+                        
+                        const qualityEntries = [];
 
-                            await Promise.all(outputFiles.map(async (outFile) => {
-                                const qualityPrefix = `${folderPath}/${outFile.label}_${fileName.replace(/\.[^/.]+$/, "")}`; // Use safe safe name format
-                                const filesToUpload = fs.readdirSync(outFile.dir);
-                                
-                                await Promise.all(filesToUpload.map(async (file) => {
-                                    const filePath = path.join(outFile.dir, file);
-                                    const resKey = `${qualityPrefix}/${file}`;
-                                    const contentType = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
-                                    
-                                    let body;
-                                    if (file.endsWith('.m3u8')) {
-                                        const m3u8Content = fs.readFileSync(filePath, 'utf8');
-                                        const backendUrl = process.env.BACKEND_URL || "http://localhost:8080";
-                                        body = m3u8Content.split('\n').map(line => {
-                                            if (line.trim().endsWith('.ts')) {
-                                                return `${backendUrl}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(`${qualityPrefix}/${line.trim()}`)}`;
-                                            }
-                                            return line;
-                                        }).join('\n');
-                                    } else {
-                                        body = fs.createReadStream(filePath);
-                                    }
-
-                                    const upload = new Upload({
-                                        client: r2Client,
-                                        params: {
-                                            Bucket: process.env.R2_BUCKET_NAME,
-                                            Key: resKey,
-                                            Body: body,
-                                            ContentType: contentType
-                                        }
-                                    });
-                                    await upload.done();
-                                }));
-
-                                console.log(`Uploaded HLS for ${outFile.label} to R2`);
-
-                                const targetRes = RESOLUTIONS.find(r => r.label === outFile.label);
-                                const bandwidth = targetRes ? parseInt(targetRes.bitrate) * 1000 : 1000000;
-                                const shortSide = outFile.shortSide;
-                                const width = shortSide === 1080 ? 1920 : shortSide === 720 ? 1280 : shortSide === 480 ? 854 : shortSide === 360 ? 640 : shortSide === 240 ? 426 : 256;
-                                
-                                const backendUrl = process.env.BACKEND_URL || "http://localhost:8080";
-                                const variantUrl = `${backendUrl}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(`${qualityPrefix}/playlist.m3u8`)}`;
-
-                                // Relative path from master to quality playlist mapping
-                                masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${shortSide}\n`;
-                                masterPlaylistContent += `${variantUrl}\n`;
-
-                                const qualityPlaylistKey = `${qualityPrefix}/playlist.m3u8`;
-                                qualityEntries.push({ label: outFile.label, key: qualityPlaylistKey, isOriginal: false });
-                            }));
-
-                            const masterKey = `${folderPath}/master_${fileName.replace(/\.[^/.]+$/, "")}.m3u8`;
-                            const masterUpload = new Upload({
-                                client: r2Client,
-                                params: {
-                                    Bucket: process.env.R2_BUCKET_NAME,
-                                    Key: masterKey,
-                                    Body: masterPlaylistContent,
-                                    ContentType: 'application/vnd.apple.mpegurl'
-                                }
-                            });
-                            await masterUpload.done();
-                            console.log(`Uploaded master playlist to R2`);
-                            
-                            qualityEntries.push({ label: 'HLS_Master', key: masterKey, isOriginal: false });
-                            
-                            for (const quality of qualityEntries) {
-                                await File.updateOne(
-                                    { _id: transferId },
-                                    { $push: { [`files.${i}.qualities`]: quality } }
-                                );
-                            }
-                        } finally {
+                        // We process sequentially to avoid overwhelming node.js/FFmpeg CPU
+                        for (const targetRes of targets) {
                             try {
-                                fs.rmSync(tempDir, { recursive: true, force: true });
+                                console.log(`[VIDEO] Transcoding stream for ${targetRes.label}...`);
+                                
+                                const getCommand = new GetObjectCommand({
+                                    Bucket: process.env.R2_BUCKET_NAME,
+                                    Key: objectKey,
+                                });
+                                // Get readable stream from R2
+                                const response = await r2Client.send(getCommand);
+                                
+                                // Pipe through FFmpeg directly
+                                const outputStream = transcodeVideo(response.Body, targetRes);
+                                
+                                const qualityPrefix = `${folderPath}/${targetRes.label}_${fileName.replace(/\.[^/.]+$/, "")}`; // Safe name format
+                                const resKey = `${qualityPrefix}.mp4`; // Output streamable fMP4 directly to R2!
+
+                                const upload = new Upload({
+                                    client: r2Client,
+                                    params: {
+                                        Bucket: process.env.R2_BUCKET_NAME,
+                                        Key: resKey,
+                                        Body: outputStream,
+                                        ContentType: 'video/mp4'
+                                    }
+                                });
+
+                                await upload.done();
+                                console.log(`[VIDEO] Uploaded fMP4 for ${targetRes.label} to R2 (${resKey})`);
+
+                                qualityEntries.push({ label: targetRes.label, key: resKey, isOriginal: false });
                             } catch (e) {
-                                console.error(`Error cleaning up tempDir ${tempDir}:`, e.message);
+                                console.error(`[VIDEO] Error streaming transcode for ${targetRes.label}:`, e.message);
                             }
+                        }
+
+                        for (const quality of qualityEntries) {
+                            await File.updateOne(
+                                { _id: transferId },
+                                { $push: { [`files.${i}.qualities`]: quality } }
+                            );
                         }
                     }
                 }
@@ -257,15 +236,6 @@ export const extractVideoResolutions = async (transferId, files) => {
                 console.warn(`[VIDEO] Could not process video ${objectKey} in bucket ${process.env.R2_BUCKET_NAME}:`, err.message);
                 if (err.name === 'NoSuchKey' || err.code === 'NoSuchKey' || err.message.includes('key does not exist')) {
                     console.error(`[VIDEO] CRITICAL: Key "${objectKey}" not found. Current R2_FOLDER is "${process.env.R2_FOLDER}". Check if this matches your storage structure.`);
-                }
-            } finally {
-                if (tempVideoPath && fs.existsSync(tempVideoPath)) {
-                    try {
-                        fs.unlinkSync(tempVideoPath);
-                        console.log(`Cleaned up temp video file: ${tempVideoPath}`);
-                    } catch (e) {
-                        console.error(`Error deleting temp video file ${tempVideoPath}:`, e.message);
-                    }
                 }
             }
         }

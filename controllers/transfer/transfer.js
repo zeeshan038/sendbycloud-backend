@@ -18,10 +18,10 @@ import {
 
 // utils
 import {
-    createZipAndUpload,
     extractVideoResolutions,
     calculateExpireDate
 } from "../../utils/methods.js";
+import { triggerWorkerZip } from "../../services/zipService.js";
 import r2Client from "../../utils/R2.js";
 import {
     PutObjectCommand,
@@ -36,6 +36,7 @@ import {
 import { sanitizeFileName } from "../../utils/methods.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { sendEmail, buildFileReceivedHtml } from "../../utils/Nodemailer.js";
+import { cleanupFiles } from "../../utils/cleanup.js";
 
 /**
  * @Description Network Speed test (Latency, Download, Upload)
@@ -227,9 +228,6 @@ export const sendFile = async (req, res) => {
         let activeBackground = background;
         let activeBackgroundType = backgroundType;
         let activeBackgroundLink = backgroundLink;
-        console.log("activeBackground", activeBackground);
-        console.log("activeBackgroundType", activeBackgroundType);
-        console.log("activeBackgroundLink", activeBackgroundLink);
 
         if (!activeBackground) {
             const query = userId ? { user: userId, isActive: true } : { isActive: true };
@@ -268,19 +266,21 @@ export const sendFile = async (req, res) => {
         }
 
         const shareLink = `${process.env.CLIENT_URL}/${file.shortId}`;
+        console.log("share link", shareLink);
 
-        if (files.length > 1) {
-            createZipAndUpload(file._id, files, file.shortId);
-        }
-
-        const hasVideos = files.some(f => {
-            const name = typeof f === 'string' ? f : (f.fileName || f.name || f.key);
-            return /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(name);
-        });
-
-        if (hasVideos || uploadType === 'Videos') {
-            extractVideoResolutions(file._id, files);
-        }
+        (async () => {
+            try {
+                if (files.length > 1) {
+                    await triggerWorkerZip(file._id.toString(), files, file.shortId);
+                }
+                if (uploadType === 'Videos') {
+                    console.log("[VIDEO] Starting background resolution extraction for", file.shortId);
+                    await extractVideoResolutions(file._id, files);
+                }
+            } catch (err) {
+                console.error("[BACKGROUND] Error:", err);
+            }
+        })();
 
         if (getShareableLink === 'true' || getShareableLink === true) {
             return res.status(200).json({
@@ -410,7 +410,7 @@ export const initiateMultipartUpload = async (req, res) => {
         // Optimized Batch Start: Sign the first batch of URLs immediately
         const initialUrls = {};
         if (partCount > 0) {
-            const batchSize = Math.min(partCount, 72); // Up to 72 parts in the first response
+            const batchSize = Math.min(partCount, 100); // First batch of presigned part URLs
             await Promise.all(
                 Array.from({ length: batchSize }, async (_, i) => {
                     const pn = i + 1;
@@ -666,52 +666,33 @@ export const verifyPassword = async (req, res) => {
 export const deleteTransfer = async (req, res) => {
     const { id } = req.params;
     try {
-        // Find and delete the transfer record
-        const transfer = await File.findByIdAndDelete(id);
+        // Find the transfer record
+        const transfer = await File.findById(id);
 
         if (!transfer) {
             return res.status(404).json({ status: false, msg: "Transfer not found" });
         }
 
-        // Cleanup files in R2
-        const cleanupFiles = async () => {
-            try {
-                // Delete individual files
-                for (const fileData of transfer.files) {
-                    const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
-                    await r2Client.send(new DeleteObjectCommand({
-                        Bucket: process.env.R2_BUCKET_NAME,
-                        Key: objectKey
-                    }));
-
-                    // Delete transcoded versions
-                    if (fileData.qualities && Array.isArray(fileData.qualities)) {
-                        for (const quality of fileData.qualities) {
-                            if (quality.key && quality.key !== objectKey) {
-                                await r2Client.send(new DeleteObjectCommand({
-                                    Bucket: process.env.R2_BUCKET_NAME,
-                                    Key: quality.key
-                                }));
+        // Reduce user storage defensively
+        if (transfer.user && transfer.totalSize && transfer.totalSize > 0) {
+            await User.updateOne(
+                { _id: transfer.user },
+                [
+                    {
+                        $set: {
+                            storageUsed: {
+                                $max: [0, { $subtract: ["$storageUsed", transfer.totalSize] }]
                             }
                         }
                     }
-                }
+                ]
+            );
+        }
 
-                // Delete zip file if it exists
-                if (transfer.zipKey) {
-                    await r2Client.send(new DeleteObjectCommand({
-                        Bucket: process.env.R2_BUCKET_NAME,
-                        Key: transfer.zipKey
-                    }));
-                }
-                console.log(`Successfully cleaned up R2 objects for transfer ${id}`);
-            } catch (err) {
-                console.error(`Error cleaning up R2 objects for transfer ${id}:`, err);
-            }
-        };
+        await File.findByIdAndDelete(id);
 
         // Run cleanup in background
-        cleanupFiles();
+        cleanupFiles(transfer);
 
         return res.status(200).json({
             status: true,
@@ -794,8 +775,8 @@ export const streamVideo = async (req, res) => {
 
             const response = await r2Client.send(fileCommand);
 
-            // Add caching for HLS segments
-            if (key.endsWith('.ts')) {
+            // Add caching for chunks
+            if (key.endsWith('.ts') || key.endsWith('.mp4')) {
                 res.setHeader('Cache-Control', 'public, max-age=31536000');
             } else if (key.endsWith('.m3u8')) {
                 res.setHeader('Cache-Control', 'no-cache');
@@ -805,12 +786,12 @@ export const streamVideo = async (req, res) => {
                 'Content-Range': `bytes ${start}-${end}/${fileSize}`,
                 'Accept-Ranges': 'bytes',
                 'Content-Length': chunksize,
-                'Content-Type': metadata.ContentType || 'video/MP2T',
+                'Content-Type': metadata.ContentType || (key.endsWith('.mp4') ? 'video/mp4' : 'video/MP2T'),
             });
             response.Body.pipe(res);
         } else {
-            // Add caching for HLS segments
-            if (key.endsWith('.ts')) {
+            // Add caching for segments
+            if (key.endsWith('.ts') || key.endsWith('.mp4')) {
                 res.setHeader('Cache-Control', 'public, max-age=31536000');
             } else if (key.endsWith('.m3u8')) {
                 res.setHeader('Cache-Control', 'no-cache');
@@ -818,7 +799,7 @@ export const streamVideo = async (req, res) => {
 
             res.writeHead(200, {
                 'Content-Length': fileSize,
-                'Content-Type': metadata.ContentType || 'video/MP2T',
+                'Content-Type': metadata.ContentType || (key.endsWith('.mp4') ? 'video/mp4' : 'video/MP2T'),
             });
 
             const fileCommand = new GetObjectCommand({
@@ -842,4 +823,152 @@ export const streamVideo = async (req, res) => {
             });
         }
     }
+};
+
+
+/**
+ * @Description Generate ALL presigned URLs for all parts in one shot
+ * @Route POST api/transfer/get-all-part-urls
+ * @Access Public
+ */
+export const getAllPartUploadUrls = async (req, res) => {
+    const { uploadId, key, totalParts } = req.body;
+    console.log('get-all-part-urls called:', { uploadId, key, totalParts });
+    try {
+        if (!uploadId || !key || !totalParts) {
+            return res.status(400).json({
+                status: false,
+                error: "uploadId, key, and totalParts are required"
+            });
+        }
+
+        const count = Number(totalParts);
+        if (!Number.isFinite(count) || count < 1 || count > 10000) {
+            return res.status(400).json({
+                status: false,
+                error: "totalParts must be a number between 1 and 10000"
+            });
+        }
+
+        // ✅ Sign all URLs in parallel — getSignedUrl is CPU-bound not I/O-bound
+        // so Promise.all here is safe and fast regardless of part count
+        const urls = await Promise.all(
+            Array.from({ length: count }, (_, i) => {
+                const command = new UploadPartCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: key,
+                    UploadId: uploadId,
+                    PartNumber: i + 1,
+                });
+                return getSignedUrl(r2Client, command, { expiresIn: 3600 });
+            })
+        );
+
+
+        console.log('Generated', urls.length, 'URLs');
+        return res.status(200).json({
+            status: true,
+            urls  // 0-indexed array: urls[0] = part 1, urls[1] = part 2, etc.
+        });
+    } catch (error) {
+        console.error("Error generating all part URLs:", error);
+        return res.status(500).json({ status: false, msg: error.message });
+    }
+};
+
+/**
+ * @Description Get all presigned download URLs for a file (Batch)
+ * @Route POST api/transfer/get-all-download-part-urls/:shortId
+ * @Access Public
+ */
+export const getAllDownloadPartUrls = async (req, res) => {
+    const { shortId } = req.params;
+    const { key, partSize, totalSize, password = "" } = req.body;
+
+    try {
+        if (!key || !partSize || !totalSize) {
+            return res.status(400).json({ status: false, error: "key, partSize, and totalSize are required" });
+        }
+
+        const isObjectId = mongoose.Types.ObjectId.isValid(shortId);
+        const transfer = await File.findOne(isObjectId ? { _id: shortId } : { shortId });
+        if (!transfer) {
+            return res.status(404).json({ status: false, msg: "Transfer not found" });
+        }
+
+        // Check password if set
+        if (transfer.password && transfer.password !== password) {
+            return res.status(401).json({ status: false, msg: "Invalid password" });
+        }
+
+        // Security: Verify that this key belongs to this transfer
+        const isValidFile = transfer.files.some(f => (typeof f === 'string' ? f : f.key) === key);
+        if (!isValidFile) {
+            return res.status(403).json({ status: false, msg: "Unauthorized: File does not belong to this transfer" });
+        }
+
+        const numParts = Math.ceil(totalSize / partSize);
+        const maxRangeParts = 10000;
+        if (numParts > maxRangeParts) {
+            return res.status(400).json({
+                status: false,
+                msg: `Too many parts (max ${maxRangeParts}); use a larger partSize for this file`
+            });
+        }
+
+        // Parallel sign all URLs
+        const parts = await Promise.all(
+            Array.from({ length: numParts }, async (_, i) => {
+                const start = i * partSize;
+                const end = Math.min((i + 1) * partSize, totalSize) - 1;
+
+                const command = new GetObjectCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: key,
+                });
+
+                const url = await getSignedUrl(r2Client, command, {
+                    expiresIn: 3600,
+                    signableHeaders: new Set(["range"])
+                });
+
+                return {
+                    partNumber: i + 1,
+                    url,
+                    range: { start, end }
+                };
+            })
+        );
+
+        return res.status(200).json({
+            status: true,
+            parts
+        });
+    } catch (error) {
+        console.error("Error generating all download part URLs:", error);
+        return res.status(500).json({ status: false, msg: error.message });
+    }
+};
+
+export const zipCompleteWebhook = async (req, res) => {
+    // Verify it's from your worker
+    const secret = req.headers['x-worker-secret'];
+    if (secret !== process.env.WORKER_SECRET) {
+        return res.status(401).json({ status: false });
+    }
+
+    const { transferId, zipKey, shortId, error } = req.body;
+
+    if (error) {
+        console.error(`[ZIP] Worker reported error for ${shortId}:`, error);
+        return res.status(200).json({ status: true });
+    }
+
+    await File.findByIdAndUpdate(transferId, { 
+        zipKey,
+        zipReady: true 
+    });
+
+    console.log(`[ZIP] ZIP ready for ${shortId}: ${zipKey}`);
+    return res.status(200).json({ status: true });
 };

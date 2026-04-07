@@ -31,3 +31,45 @@ export const startCleanupJob = () => {
     setTimeout(runCleanup, 10000);
     setInterval(runCleanup, interval);
 };
+
+
+
+
+// Cleanup files in R2
+export const cleanupFiles = async (transfer) => {
+    try {
+        // Delete individual files
+        for (const fileData of transfer.files) {
+            const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
+            await r2Client.send(new DeleteObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: objectKey
+            }));
+
+            // Delete transcoded versions
+            if (fileData.qualities && Array.isArray(fileData.qualities)) {
+                for (const quality of fileData.qualities) {
+                    if (quality.key && quality.key !== objectKey) {
+                        await r2Client.send(new DeleteObjectCommand({
+                            Bucket: process.env.R2_BUCKET_NAME,
+                            Key: quality.key
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Delete zip file if it exists
+        if (transfer.zipKey) {
+            await r2Client.send(new DeleteObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: transfer.zipKey
+            }));
+        }
+    } catch (err) {
+        return res.status(404).json({
+            status: false,
+            msg: err.message
+        })
+    }
+};
