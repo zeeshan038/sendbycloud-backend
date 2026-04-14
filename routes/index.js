@@ -10,6 +10,7 @@ import receivedRouter from "./received.js";
 import videoRouter from "./vidoes.js";
 import backgroundRouter from "./background.js";
 import otpRouter from "./otp.js";
+import reportRouter from "./Report.js";
 
 router.use("/user", userRouter);
 router.use("/uploads", uploadRouter);
@@ -19,5 +20,6 @@ router.use("/received", receivedRouter);
 router.use('/videos',videoRouter);
 router.use('/background',backgroundRouter);
 router.use('/otp', otpRouter);
+router.use('/report', reportRouter);
 
 export default router; 

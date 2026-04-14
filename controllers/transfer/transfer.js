@@ -21,7 +21,7 @@ import {
     extractVideoResolutions,
     calculateExpireDate
 } from "../../utils/methods.js";
-import { triggerWorkerZip } from "../../services/zipService.js";
+// import { triggerWorkerZip } from "../../services/zipService.js";
 import r2Client from "../../utils/R2.js";
 import {
     PutObjectCommand,
@@ -37,6 +37,32 @@ import { sanitizeFileName } from "../../utils/methods.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { sendEmail, buildFileReceivedHtml } from "../../utils/Nodemailer.js";
 import { cleanupFiles } from "../../utils/cleanup.js";
+
+const toPosixPath = (value = "") => value.replace(/\\/g, "/");
+
+const getParentPrefix = (objectKey) => {
+    const normalized = toPosixPath(objectKey || "");
+    const lastSlash = normalized.lastIndexOf("/");
+    return lastSlash >= 0 ? normalized.slice(0, lastSlash + 1) : "";
+};
+
+const rewriteM3u8ForProxy = ({ playlistContent, playlistKey, shortId, password }) => {
+    const basePrefix = getParentPrefix(playlistKey);
+    const lines = playlistContent.split(/\r?\n/);
+
+    return lines.map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) return line;
+
+        if (/^(https?:)?\/\//i.test(trimmed)) return line;
+
+        const resolvedKey = toPosixPath(new URL(trimmed, `https://sbc.local/${basePrefix}`).pathname.replace(/^\//, ""));
+        const params = new URLSearchParams({ key: resolvedKey });
+        if (password) params.set("password", password);
+
+        return `/api/transfer/stream/${shortId}?${params.toString()}`;
+    }).join("\n");
+};
 
 /**
  * @Description Network Speed test (Latency, Download, Upload)
@@ -270,15 +296,15 @@ export const sendFile = async (req, res) => {
 
         (async () => {
             try {
-                if (files.length > 1) {
-                    await triggerWorkerZip(file._id.toString(), files, file.shortId);
-                }
+                // if (files.length > 1) {
+                //     await triggerWorkerZip(file._id.toString(), files, file.shortId);
+                // }
                 if (uploadType === 'Videos') {
                     console.log("[VIDEO] Starting background resolution extraction for", file.shortId);
                     await extractVideoResolutions(file._id, files);
                 }
             } catch (err) {
-                console.error("[BACKGROUND] Error:", err);
+                console.error('[BACKGROUND] Error:', err);
             }
         })();
 
@@ -298,7 +324,6 @@ export const sendFile = async (req, res) => {
 
         const text = `${senderEmail} shared ${fileCount} file${fileCount > 1 ? "s" : ""} with you via SendByCloud.\n\nDownload: ${shareLink}\n\nThis link expires on: ${formattedExpireDate}`;
 
-        // send email to receiver
         await sendEmail({
             to: recevierEmails,
             subject,
@@ -312,7 +337,6 @@ export const sendFile = async (req, res) => {
                 clientUrl: process.env.CLIENT_URL,
             }),
         });
-
 
         return res.status(200).json({
             status: true,
@@ -521,13 +545,28 @@ export const completeMultipartUpload = async (req, res) => {
             return res.status(400).json({ status: false, error: "uploadId, key, and parts are required" });
         }
 
-        // Parts must be sorted by PartNumber
-        const sortedParts = parts
+        // ✅ Filter out invalid parts and validate ETags
+        const validParts = parts.filter(part => part.ETag && part.PartNumber);
+        
+        if (validParts.length === 0) {
+            return res.status(400).json({ 
+                status: false, 
+                error: `No valid parts provided. Received ${parts.length} parts but none had valid ETags.` 
+            });
+        }
+
+        console.log(`[MULTIPART] Completing upload for ${key} with ${validParts.length} parts`);
+
+        const sortedParts = validParts
             .map(part => ({
-                ETag: part.ETag,
+                ETag: part.ETag.includes('"') ? part.ETag : `"${part.ETag}"`,
                 PartNumber: Number(part.PartNumber)
             }))
             .sort((a, b) => a.PartNumber - b.PartNumber);
+
+        // ✅ Log first and last part for debugging
+        console.log(`[MULTIPART] First part:`, sortedParts[0]);
+        console.log(`[MULTIPART] Last part:`, sortedParts[sortedParts.length - 1]);
 
         const command = new CompleteMultipartUploadCommand({
             Bucket: process.env.R2_BUCKET_NAME,
@@ -548,6 +587,8 @@ export const completeMultipartUpload = async (req, res) => {
         });
     } catch (error) {
         console.error("Error completing multipart upload:", error);
+        // ✅ Log the parts that caused the error
+        console.error("Parts that caused error:", JSON.stringify(parts?.slice(0, 3)));
         return res.status(500).json({ status: false, msg: error.message });
     }
 };
@@ -723,7 +764,6 @@ export const streamVideo = async (req, res) => {
             return res.status(404).json({ status: false, msg: "Transfer not found" });
         }
 
-        // Check password if set
         if (transfer.password && transfer.password !== password) {
             return res.status(401).json({ status: false, msg: "Invalid password" });
         }
@@ -732,7 +772,6 @@ export const streamVideo = async (req, res) => {
         const isValidFile = transfer.files.some(f => {
             const mainKey = typeof f === 'string' ? f : f.key;
             if (mainKey === key) return true;
-            // Also check transcoded qualities
             if (f.qualities && Array.isArray(f.qualities)) {
                 return f.qualities.some(q => {
                     if (q.key === key) return true;
@@ -748,70 +787,48 @@ export const streamVideo = async (req, res) => {
 
         if (!isValidFile) {
             console.error(`Security alert: Key ${key} does not belong to transfer ${shortId}`);
-            console.log("Available keys in this transfer:", transfer.files.map(f => typeof f === 'string' ? f : (f.key || f)));
             return res.status(403).json({ status: false, msg: "Unauthorized: File does not belong to this transfer" });
         }
 
-        const range = req.headers.range;
-        const headCommand = new HeadObjectCommand({
+        const isPlaylist = key.endsWith(".m3u8");
+        const isMp4 = /\.(mp4|mov|avi|webm|mkv|m4v)$/i.test(key);
+        const isTs = key.endsWith(".ts");
+
+        // ✅ HLS playlists — must proxy through server to rewrite URIs
+        if (isPlaylist) {
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+
+            const playlistObj = await r2Client.send(new GetObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: key
+            }));
+
+            const body = await playlistObj.Body.transformToString();
+            const rewritten = rewriteM3u8ForProxy({
+                playlistContent: body,
+                playlistKey: key,
+                shortId,
+                password
+            });
+
+            return res.status(200).send(rewritten);
+        }
+
+        // ✅ Segments and video files — redirect directly to R2
+        // Browser downloads at full R2 speed, bypasses Pakistan server completely
+        const signedUrl = await getSignedUrl(r2Client, new GetObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
             Key: key,
-        });
+            ResponseContentType: isTs ? 'video/MP2T' : 'video/mp4',
+            ResponseCacheControl: 'public, max-age=31536000',
+        }), { expiresIn: 21600 }); // 6 hours
 
-        const metadata = await r2Client.send(headCommand);
-        const fileSize = metadata.ContentLength;
+        return res.redirect(302, signedUrl);
 
-        if (range) {
-            const parts = range.replace(/bytes=/, "").split("-");
-            const start = parseInt(parts[0], 10);
-            const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + 1024 * 1024, fileSize - 1); // 1MB chunks
-
-            const chunksize = (end - start) + 1;
-            const fileCommand = new GetObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: key,
-                Range: `bytes=${start}-${end}`,
-            });
-
-            const response = await r2Client.send(fileCommand);
-
-            // Add caching for chunks
-            if (key.endsWith('.ts') || key.endsWith('.mp4')) {
-                res.setHeader('Cache-Control', 'public, max-age=31536000');
-            } else if (key.endsWith('.m3u8')) {
-                res.setHeader('Cache-Control', 'no-cache');
-            }
-
-            res.writeHead(206, {
-                'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-                'Accept-Ranges': 'bytes',
-                'Content-Length': chunksize,
-                'Content-Type': metadata.ContentType || (key.endsWith('.mp4') ? 'video/mp4' : 'video/MP2T'),
-            });
-            response.Body.pipe(res);
-        } else {
-            // Add caching for segments
-            if (key.endsWith('.ts') || key.endsWith('.mp4')) {
-                res.setHeader('Cache-Control', 'public, max-age=31536000');
-            } else if (key.endsWith('.m3u8')) {
-                res.setHeader('Cache-Control', 'no-cache');
-            }
-
-            res.writeHead(200, {
-                'Content-Length': fileSize,
-                'Content-Type': metadata.ContentType || (key.endsWith('.mp4') ? 'video/mp4' : 'video/MP2T'),
-            });
-
-            const fileCommand = new GetObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: key,
-            });
-            const response = await r2Client.send(fileCommand);
-            response.Body.pipe(res);
-        }
     } catch (error) {
         if (error.name === 'NotFound') {
-            console.error(`File physically missing on R2: ${key}`);
+            console.error(`File missing on R2: ${key}`);
         } else {
             console.error("Streaming error:", error);
         }
@@ -824,7 +841,6 @@ export const streamVideo = async (req, res) => {
         }
     }
 };
-
 
 /**
  * @Description Generate ALL presigned URLs for all parts in one shot
@@ -964,9 +980,9 @@ export const zipCompleteWebhook = async (req, res) => {
         return res.status(200).json({ status: true });
     }
 
-    await File.findByIdAndUpdate(transferId, { 
+    await File.findByIdAndUpdate(transferId, {
         zipKey,
-        zipReady: true 
+        zipReady: true
     });
 
     console.log(`[ZIP] ZIP ready for ${shortId}: ${zipKey}`);

@@ -6,10 +6,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import r2Client from "../../utils/R2.js";
 import File from "../../models/files.js";
 import { destroyTransfer } from "../../utils/methods.js";
-
+import archiver from 'archiver';
 // Constants
 const SIGNED_URL_EXPIRY = 7200;
 const MAX_DOWNLOAD_RANGE_PARTS = 10000;
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8080";
 
 const _transferCache = new Map();
 
@@ -86,7 +87,7 @@ export const getDownloadUrl = async (req, res) => {
         return {
           objectKey: null, url: null, isDirectUrl: false, fileName: null, size: null,
           contentType: null, rangeSupported: true, qualities: null,
-          resolution: null, duration: null, streamUrl: null, missing: true
+          resolution: null, duration: null, streamUrl: null, hlsReady: false, missing: true
         };
       }
 
@@ -98,15 +99,12 @@ export const getDownloadUrl = async (req, res) => {
       let url = null;
       let missing = false;
 
-      // ── Presigned R2 URL — NO Range baked in, so frontend can send any
-      // Range header it needs. This URL is valid for the whole file.
       try {
         const command = new GetObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: objectKey,
           ResponseContentDisposition: buildDownloadDisposition(originalName, preview),
           ResponseCacheControl: "public, max-age=3600"
-          // ← No Range here intentionally. Frontend sends Range as a header.
         });
         url = await getSignedUrl(r2Client, command, { expiresIn: SIGNED_URL_EXPIRY });
       } catch (err) {
@@ -114,16 +112,36 @@ export const getDownloadUrl = async (req, res) => {
         missing = true;
       }
 
+      // ✅ Fix: properly handle HLS qualities and build stream URL
       let qualityUrls = [];
       let hlsMasterKey = null;
+      let hlsStreamUrl = null;
 
       if (typeof fileData === "object" && Array.isArray(fileData?.qualities) && fileData.qualities.length > 0) {
+
+        // ✅ Find HLS master first
+        const hlsMaster = fileData.qualities.find(q => q.label === "HLS_Master");
+        if (hlsMaster) {
+          hlsMasterKey = hlsMaster.key;
+          hlsStreamUrl = `${BACKEND_URL}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(hlsMaster.key)}`;
+        }
+
+        // ✅ Process all qualities — stream URLs for HLS, presigned for MP4
         const processedQualities = await runLimitedParallel(fileData.qualities, 5, async (q) => {
+          // Skip HLS_Master — handled separately via streamUrl
+          if (q.label === "HLS_Master") return null;
+
+          // Resolution playlists (144p, 240p, 360p) — build stream URL
           if (q.key && q.key.endsWith(".m3u8")) {
-            if (q.label === "HLS_Master") hlsMasterKey = q.key;
-            return null;
+            return {
+              label: q.label,
+              url: `${BACKEND_URL}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(q.key)}`,
+              isOriginal: q.isOriginal,
+              isHLS: true
+            };
           }
 
+          // Original MP4 — generate presigned download URL
           try {
             const qCommand = new GetObjectCommand({
               Bucket: process.env.R2_BUCKET_NAME,
@@ -132,7 +150,7 @@ export const getDownloadUrl = async (req, res) => {
               ResponseCacheControl: "public, max-age=3600"
             });
             const qUrl = await getSignedUrl(r2Client, qCommand, { expiresIn: SIGNED_URL_EXPIRY });
-            return { label: q.label, url: qUrl, isOriginal: q.isOriginal };
+            return { label: q.label, url: qUrl, isOriginal: q.isOriginal, isHLS: false };
           } catch (err) {
             console.error(`Error generating quality URL: ${q.key}`, err);
             return { label: q.label, url: null, isOriginal: q.isOriginal, missing: true };
@@ -141,16 +159,23 @@ export const getDownloadUrl = async (req, res) => {
         qualityUrls = processedQualities.filter(Boolean);
       }
 
+      // ✅ Build stream URL — use HLS master if available, fallback to direct stream
       let streamUrlResult = null;
-      if (/\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName)) {
-        const streamKey = hlsMasterKey || objectKey;
-        streamUrlResult = `${process.env.BACKEND_URL || "http://localhost:8080"}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(streamKey)}`;
+      const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName);
+      if (isVideo) {
+        if (hlsStreamUrl) {
+          // HLS is ready — use master playlist stream
+          streamUrlResult = hlsStreamUrl;
+        } else {
+          // No HLS yet — stream original file directly
+          streamUrlResult = `${BACKEND_URL}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`;
+        }
       }
 
       return {
         objectKey,
         url,
-        isDirectUrl: true,  // presigned R2 URLs support Range headers natively
+        isDirectUrl: true,
         fileName: originalName,
         size: typeof fileData === "object" ? fileData?.size || null : null,
         contentType: typeof fileData === "object" ? fileData?.type || fileData?.fileType || null : null,
@@ -159,6 +184,7 @@ export const getDownloadUrl = async (req, res) => {
         resolution: typeof fileData === "object" ? fileData?.resolution || null : null,
         duration: typeof fileData === "object" ? fileData?.duration || null : null,
         streamUrl: streamUrlResult,
+        hlsReady: !!hlsStreamUrl,  // ✅ tells frontend whether HLS is available
         missing
       };
     });
@@ -265,7 +291,6 @@ export const completeDownload = async (req, res) => {
     );
 
     invalidateCache(shortId);
-
     console.log(`Download completed for transfer: ${shortId}. New count: ${updated.downloadCount}`);
 
     if (updated.selfDestruct && updated.downloadCount >= 1) {
@@ -285,7 +310,6 @@ export const completeDownload = async (req, res) => {
   }
 };
 
-// ─── POST /api/transfer/download-cancel/:shortId ──────────────────────────────
 export const cancelDownload = async (req, res) => {
   const { shortId } = req.params;
   const { downloadSessionId } = req.body;
@@ -305,13 +329,6 @@ export const cancelDownload = async (req, res) => {
   }
 };
 
-
-// ─── POST /api/transfer/download-part/:shortId ────────────────────────────────
-// FIX: Range is NO LONGER baked into the presigned URL.
-// The signed URL covers the whole file. The frontend must send
-//   Range: bytes=<start>-<end>
-// as a request header when fetching the returned URL.
-// This prevents R2 signature mismatches that caused silent part hangs.
 export const getDownloadPartUrl = async (req, res) => {
   const { shortId } = req.params;
   const { key, partNumber, partSize, password = "" } = req.body;
@@ -428,9 +445,6 @@ export const getDownloadPartUrl = async (req, res) => {
   }
 };
 
-
-
-// ─── POST /api/transfer/get-all-download-part-urls/:shortId ──────────────────
 export const getAllDownloadPartUrls = async (req, res) => {
   const { shortId } = req.params;
   const { key, partSize, totalSize, password = "" } = req.body;
@@ -474,8 +488,6 @@ export const getAllDownloadPartUrls = async (req, res) => {
         msg: `Too many parts (max ${MAX_DOWNLOAD_RANGE_PARTS}); use a larger partSize for this file`
       });
 
-    // Sign ONE url — R2 presigned URLs support Range headers natively
-    // so we only need a single URL, the frontend sends Range per part
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
       Key: effectiveKey,
@@ -484,7 +496,6 @@ export const getAllDownloadPartUrls = async (req, res) => {
 
     const url = await getSignedUrl(r2Client, command, { expiresIn: SIGNED_URL_EXPIRY });
 
-    // Build range map for all parts
     const parts = Array.from({ length: numParts }, (_, i) => {
       const start = i * partSize;
       const end = Math.min(start + partSize - 1, totalSize - 1);
@@ -497,4 +508,60 @@ export const getAllDownloadPartUrls = async (req, res) => {
     console.error("Error generating batch download URLs:", error);
     return res.status(500).json({ status: false, msg: error.message });
   }
+};
+
+
+/**
+ * @Description Stream the Zip
+ * @Route GET /api/transfer/stream/:shortId
+ * @Access Public
+ */
+export const streamZip = async (req, res) => {
+    const { shortId } = req.params;
+    const { password = '' } = req.query;
+
+    try {
+        const transfer = await File.findOne({ shortId });
+        if (!transfer) return res.status(404).json({ status: false, msg: 'Transfer not found' });
+
+        if (transfer.password && transfer.password !== password) {
+            return res.status(401).json({ status: false, msg: 'Invalid password' });
+        }
+
+        const archive = archiver('zip', { store: true }); // store = no compression, faster
+
+        archive.on('error', (err) => {
+            console.error('[ZIP STREAM] Error:', err);
+            if (!res.headersSent) res.status(500).json({ status: false, msg: err.message });
+        });
+
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="sendbycloud-${shortId}.zip"`);
+        res.setHeader('Transfer-Encoding', 'chunked');
+
+        archive.pipe(res);
+
+        for (const fileData of transfer.files) {
+            const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
+            const fileName = typeof fileData === 'object' && fileData.name
+                ? fileData.name
+                : objectKey.split('/').pop();
+
+            console.log(`[ZIP STREAM] Adding ${fileName}`);
+
+            const obj = await r2Client.send(new GetObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: objectKey,
+            }));
+
+            archive.append(obj.Body, { name: fileName });
+        }
+
+        await archive.finalize();
+        console.log(`[ZIP STREAM] Done for ${shortId}`);
+
+    } catch (err) {
+        console.error('[ZIP STREAM] Error:', err);
+        if (!res.headersSent) res.status(500).json({ status: false, msg: err.message });
+    }
 };

@@ -129,20 +129,33 @@ export const viewBackground = async (req, res) => {
             return res.status(400).json({ status: false, msg: "Key is required" });
         }
 
-        const command = new GetObjectCommand({
+        const commandParams = {
             Bucket: process.env.R2_BUCKET_NAME,
             Key: key,
-        });
+        };
 
+        if (req.headers.range) {
+            commandParams.Range = req.headers.range;
+        }
+
+        const command = new GetObjectCommand(commandParams);
         const response = await r2Client.send(command);
 
         // Set content-type and other headers
         res.setHeader('Content-Type', response.ContentType);
-        res.setHeader('Content-Length', response.ContentLength);
+        res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+        
+        if (response.ContentLength) res.setHeader('Content-Length', response.ContentLength);
+        if (response.ContentRange) res.setHeader('Content-Range', response.ContentRange);
+
+        // Send 206 Partial Content if a range was requested and served
+        const statusCode = response.ContentRange ? 206 : 200;
+        res.status(statusCode);
 
         // Pipe the stream to response
         response.Body.pipe(res);
+
     } catch (error) {
         console.error("Error viewing background:", error);
         if (error.name === "NoSuchKey") {

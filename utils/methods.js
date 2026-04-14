@@ -7,10 +7,9 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { nanoid } from "nanoid";
-import { getVideoMetadata, RESOLUTIONS, transcodeVideo } from "./videoProcessor.js";
+import { getVideoMetadata, RESOLUTIONS, transcodeToHLS } from "./videoProcessor.js";
 
 import { GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import r2Client from "./R2.js";
 import File from "../models/files.js";
 import User from "../models/User.js";
@@ -136,111 +135,73 @@ export const extractVideoResolutions = async (transferId, files) => {
         const transfer = await File.findById(transferId);
         if (!transfer) return;
 
-        const updatedFiles = transfer.files;
-
-        for (let i = 0; i < updatedFiles.length; i++) {
-            const fileData = updatedFiles[i];
+        for (let i = 0; i < transfer.files.length; i++) {
+            const fileData = transfer.files[i];
             const objectKey = typeof fileData === 'string' ? fileData : fileData.key;
-            
-            // Critical check for literal 'TRANSFER_ID' string which suggests a frontend/upload bug
-            if (objectKey.includes("TRANSFER_ID")) {
-                console.error(`[VIDEO] CRITICAL: Literal "TRANSFER_ID" found in key "${objectKey}". This transfer is corrupted and cannot be processed. Please check your frontend logic.`);
+
+            // Skip corrupted keys
+            if (!objectKey || objectKey.includes('TRANSFER_ID')) {
+                console.error(`[VIDEO] Skipping corrupted key: ${objectKey}`);
                 continue;
             }
 
-            // Check if it's a video by extension
+            // Only process video files
             const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(objectKey);
             if (!isVideo) continue;
 
             try {
-                console.log(`[VIDEO] Getting metadata for ${objectKey} without downloading using presigned URL...`);
+                console.log(`[VIDEO] Processing ${objectKey}...`);
 
-                const presignedUrl = await getSignedUrl(r2Client, new GetObjectCommand({
-                    Bucket: process.env.R2_BUCKET_NAME,
-                    Key: objectKey,
-                }), { expiresIn: 3600 });
+                // Get video metadata — downloads first 5MB to temp file, avoids ffprobe URL crash
+                const metadata = await getVideoMetadata(objectKey);
+                if (!metadata) {
+                    console.warn(`[VIDEO] Could not get metadata for ${objectKey}`);
+                    continue;
+                }
 
-                const metadata = await getVideoMetadata(presignedUrl);
+                console.log(`[VIDEO] ${objectKey} — ${metadata.width}x${metadata.height}, ${metadata.duration}s`);
 
-                if (metadata && metadata.shortSide) {
-                    // Update metadata immediately
-                    const fileToUpdate = typeof updatedFiles[i] === 'string' ? { key: objectKey } : updatedFiles[i];
-                    fileToUpdate.resolution = `${metadata.shortSide}p`;
-                    fileToUpdate.duration = metadata.duration;
-                    fileToUpdate.metadata = metadata;
-                    if (!fileToUpdate.qualities) {
-                        fileToUpdate.qualities = [{ label: 'Original', key: objectKey, isOriginal: true }];
+                // Update DB with metadata immediately
+                await File.updateOne(
+                    { _id: transferId },
+                    {
+                        $set: {
+                            [`files.${i}.resolution`]: `${metadata.shortSide}p`,
+                            [`files.${i}.duration`]: metadata.duration,
+                        }
                     }
+                );
 
+                // Transcode to HLS
+                const qualities = await transcodeToHLS(
+                    transferId,
+                    i,
+                    objectKey,
+                    metadata,
+                    (progress) => {
+                        console.log(`[VIDEO] ${progress.resolution}: ${progress.progress}% (overall: ${progress.overall}%)`);
+                    }
+                );
+
+                // Update DB with all quality entries
+                if (qualities && qualities.length > 0) {
                     await File.updateOne(
                         { _id: transferId },
-                        { $set: { [`files.${i}`]: fileToUpdate } }
+                        { $set: { [`files.${i}.qualities`]: qualities } }
                     );
-
-                    const targets = RESOLUTIONS.filter(r => r.shortSide < metadata.shortSide);
-                    if (targets.length > 0) {
-                        console.log(`Starting stream-based multi-resolution transcoding for ${objectKey}`);
-
-                        const pathParts = objectKey.split('/');
-                        const fileName = pathParts.pop();
-                        const folderPath = pathParts.join('/');
-                        
-                        const qualityEntries = [];
-
-                        // We process sequentially to avoid overwhelming node.js/FFmpeg CPU
-                        for (const targetRes of targets) {
-                            try {
-                                console.log(`[VIDEO] Transcoding stream for ${targetRes.label}...`);
-                                
-                                const getCommand = new GetObjectCommand({
-                                    Bucket: process.env.R2_BUCKET_NAME,
-                                    Key: objectKey,
-                                });
-                                // Get readable stream from R2
-                                const response = await r2Client.send(getCommand);
-                                
-                                // Pipe through FFmpeg directly
-                                const outputStream = transcodeVideo(response.Body, targetRes);
-                                
-                                const qualityPrefix = `${folderPath}/${targetRes.label}_${fileName.replace(/\.[^/.]+$/, "")}`; // Safe name format
-                                const resKey = `${qualityPrefix}.mp4`; // Output streamable fMP4 directly to R2!
-
-                                const upload = new Upload({
-                                    client: r2Client,
-                                    params: {
-                                        Bucket: process.env.R2_BUCKET_NAME,
-                                        Key: resKey,
-                                        Body: outputStream,
-                                        ContentType: 'video/mp4'
-                                    }
-                                });
-
-                                await upload.done();
-                                console.log(`[VIDEO] Uploaded fMP4 for ${targetRes.label} to R2 (${resKey})`);
-
-                                qualityEntries.push({ label: targetRes.label, key: resKey, isOriginal: false });
-                            } catch (e) {
-                                console.error(`[VIDEO] Error streaming transcode for ${targetRes.label}:`, e.message);
-                            }
-                        }
-
-                        for (const quality of qualityEntries) {
-                            await File.updateOne(
-                                { _id: transferId },
-                                { $push: { [`files.${i}.qualities`]: quality } }
-                            );
-                        }
-                    }
+                    console.log(`[VIDEO] DB updated with ${qualities.length} qualities for ${objectKey}`);
                 }
+
             } catch (err) {
-                console.warn(`[VIDEO] Could not process video ${objectKey} in bucket ${process.env.R2_BUCKET_NAME}:`, err.message);
-                if (err.name === 'NoSuchKey' || err.code === 'NoSuchKey' || err.message.includes('key does not exist')) {
-                    console.error(`[VIDEO] CRITICAL: Key "${objectKey}" not found. Current R2_FOLDER is "${process.env.R2_FOLDER}". Check if this matches your storage structure.`);
-                }
+                console.error(`[VIDEO] Error processing ${objectKey}:`, err.message);
+                // Continue with next file even if one fails
             }
         }
+
+        console.log(`[VIDEO] All videos processed for transfer ${transferId}`);
+
     } catch (error) {
-        console.error("Error in extractVideoResolutions:", error);
+        console.error('[VIDEO] extractVideoResolutions error:', error.message);
     }
 };
 
