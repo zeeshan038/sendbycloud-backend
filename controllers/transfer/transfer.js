@@ -731,8 +731,7 @@ export const deleteTransfer = async (req, res) => {
         }
 
         await File.findByIdAndDelete(id);
-
-        // Run cleanup in background
+        
         cleanupFiles(transfer);
 
         return res.status(200).json({
@@ -746,7 +745,7 @@ export const deleteTransfer = async (req, res) => {
 
 /**
  * @Description Stream video in chunks (Range requests)
- * @Route GET api/transfer/stream/:shortId?key=...
+ * @Route GET api/transfer/stream/:shortId?key=
  * @Access Public
  */
 export const streamVideo = async (req, res) => {
