@@ -85,14 +85,10 @@ export const generateBackgroundUploadUrl = async (req, res) => {
             ContentType: fileType,
         });
 
-        // 1 hour expiry for the upload link
         const uploadUrl = await getSignedUrl(r2Client, command, { expiresIn: 3600 });
         
-        // Final public URL
-        // Using a backend proxy route to avoid Cloudflare R2 public domain issues
         const publicUrl = `${process.env.BACKEND_URL}/api/background/view/${objectKey}`;
 
-        // Diagnostic Signed URL (valid for 24 hours) to verify file existence
         const getCommand = new GetObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
             Key: objectKey,
@@ -141,19 +137,14 @@ export const viewBackground = async (req, res) => {
         const command = new GetObjectCommand(commandParams);
         const response = await r2Client.send(command);
 
-        // Set content-type and other headers
         res.setHeader('Content-Type', response.ContentType);
         res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+        res.setHeader('Cache-Control', 'public, max-age=31536000');
         
         if (response.ContentLength) res.setHeader('Content-Length', response.ContentLength);
         if (response.ContentRange) res.setHeader('Content-Range', response.ContentRange);
-
-        // Send 206 Partial Content if a range was requested and served
         const statusCode = response.ContentRange ? 206 : 200;
         res.status(statusCode);
-
-        // Pipe the stream to response
         response.Body.pipe(res);
 
     } catch (error) {
@@ -189,13 +180,11 @@ export const deleteBg = async (req, res) => {
         // Attempt to delete it from R2 storage
         if (background.url) {
             try {
-                // parse out the key from URL
                 let key = background.url;
                 try {
                     const parsedUrl = new URL(background.url);
-                    key = parsedUrl.pathname.substring(1); // remove leading slash
+                    key = parsedUrl.pathname.substring(1); 
                 } catch (e) {
-                    // if it's not a valid URL (just the key itself), use it directly
                 }
                 
                 await r2Client.send(new DeleteObjectCommand({

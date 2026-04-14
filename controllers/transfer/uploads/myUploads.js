@@ -137,7 +137,6 @@ export const deleteFile = async (req, res) => {
                 });
             } catch (emailError) {
                 console.error("Failed to send destruction email:", emailError);
-                // We don't fail the deletion if the email fails
             }
         }
 

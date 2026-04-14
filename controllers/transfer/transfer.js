@@ -434,7 +434,7 @@ export const initiateMultipartUpload = async (req, res) => {
         // Optimized Batch Start: Sign the first batch of URLs immediately
         const initialUrls = {};
         if (partCount > 0) {
-            const batchSize = Math.min(partCount, 100); // First batch of presigned part URLs
+            const batchSize = Math.min(partCount, 100); 
             await Promise.all(
                 Array.from({ length: batchSize }, async (_, i) => {
                     const pn = i + 1;
@@ -545,7 +545,6 @@ export const completeMultipartUpload = async (req, res) => {
             return res.status(400).json({ status: false, error: "uploadId, key, and parts are required" });
         }
 
-        // ✅ Filter out invalid parts and validate ETags
         const validParts = parts.filter(part => part.ETag && part.PartNumber);
         
         if (validParts.length === 0) {
@@ -564,9 +563,6 @@ export const completeMultipartUpload = async (req, res) => {
             }))
             .sort((a, b) => a.PartNumber - b.PartNumber);
 
-        // ✅ Log first and last part for debugging
-        console.log(`[MULTIPART] First part:`, sortedParts[0]);
-        console.log(`[MULTIPART] Last part:`, sortedParts[sortedParts.length - 1]);
 
         const command = new CompleteMultipartUploadCommand({
             Bucket: process.env.R2_BUCKET_NAME,
@@ -793,7 +789,6 @@ export const streamVideo = async (req, res) => {
         const isMp4 = /\.(mp4|mov|avi|webm|mkv|m4v)$/i.test(key);
         const isTs = key.endsWith(".ts");
 
-        // ✅ HLS playlists — must proxy through server to rewrite URIs
         if (isPlaylist) {
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -813,9 +808,7 @@ export const streamVideo = async (req, res) => {
 
             return res.status(200).send(rewritten);
         }
-
-        // ✅ Segments and video files — redirect directly to R2
-        // Browser downloads at full R2 speed, bypasses Pakistan server completely
+        
         const signedUrl = await getSignedUrl(r2Client, new GetObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
             Key: key,
@@ -865,8 +858,6 @@ export const getAllPartUploadUrls = async (req, res) => {
             });
         }
 
-        // ✅ Sign all URLs in parallel — getSignedUrl is CPU-bound not I/O-bound
-        // so Promise.all here is safe and fast regardless of part count
         const urls = await Promise.all(
             Array.from({ length: count }, (_, i) => {
                 const command = new UploadPartCommand({
@@ -883,7 +874,7 @@ export const getAllPartUploadUrls = async (req, res) => {
         console.log('Generated', urls.length, 'URLs');
         return res.status(200).json({
             status: true,
-            urls  // 0-indexed array: urls[0] = part 1, urls[1] = part 2, etc.
+            urls 
         });
     } catch (error) {
         console.error("Error generating all part URLs:", error);

@@ -112,26 +112,21 @@ export const getDownloadUrl = async (req, res) => {
         missing = true;
       }
 
-      // ✅ Fix: properly handle HLS qualities and build stream URL
       let qualityUrls = [];
       let hlsMasterKey = null;
       let hlsStreamUrl = null;
 
       if (typeof fileData === "object" && Array.isArray(fileData?.qualities) && fileData.qualities.length > 0) {
 
-        // ✅ Find HLS master first
         const hlsMaster = fileData.qualities.find(q => q.label === "HLS_Master");
         if (hlsMaster) {
           hlsMasterKey = hlsMaster.key;
           hlsStreamUrl = `${BACKEND_URL}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(hlsMaster.key)}`;
         }
 
-        // ✅ Process all qualities — stream URLs for HLS, presigned for MP4
         const processedQualities = await runLimitedParallel(fileData.qualities, 5, async (q) => {
-          // Skip HLS_Master — handled separately via streamUrl
           if (q.label === "HLS_Master") return null;
 
-          // Resolution playlists (144p, 240p, 360p) — build stream URL
           if (q.key && q.key.endsWith(".m3u8")) {
             return {
               label: q.label,
@@ -141,7 +136,6 @@ export const getDownloadUrl = async (req, res) => {
             };
           }
 
-          // Original MP4 — generate presigned download URL
           try {
             const qCommand = new GetObjectCommand({
               Bucket: process.env.R2_BUCKET_NAME,
@@ -159,15 +153,12 @@ export const getDownloadUrl = async (req, res) => {
         qualityUrls = processedQualities.filter(Boolean);
       }
 
-      // ✅ Build stream URL — use HLS master if available, fallback to direct stream
       let streamUrlResult = null;
       const isVideo = /\.(mp4|mov|avi|wmv|flv|webm|mkv|m4v)$/i.test(originalName);
       if (isVideo) {
         if (hlsStreamUrl) {
-          // HLS is ready — use master playlist stream
           streamUrlResult = hlsStreamUrl;
         } else {
-          // No HLS yet — stream original file directly
           streamUrlResult = `${BACKEND_URL}/api/transfer/stream/${transfer.shortId}?key=${encodeURIComponent(objectKey)}`;
         }
       }
@@ -184,7 +175,7 @@ export const getDownloadUrl = async (req, res) => {
         resolution: typeof fileData === "object" ? fileData?.resolution || null : null,
         duration: typeof fileData === "object" ? fileData?.duration || null : null,
         streamUrl: streamUrlResult,
-        hlsReady: !!hlsStreamUrl,  // ✅ tells frontend whether HLS is available
+        hlsReady: !!hlsStreamUrl,  
         missing
       };
     });
